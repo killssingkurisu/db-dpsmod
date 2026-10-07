@@ -104,6 +104,9 @@ const pkt = {
     cast: (source, power) => frame(0x09, new BitWriter().uint(source).uint(power).bool(true).bool(false).bool(false).bool(false).bool(false).bool(false).buffer()),
     hit: (target, source, damage, power, crit) =>
         frame(0x0a, new BitWriter().uint(target).uint(source).sint(damage).uint(power).bool(false).bool(false).bool(crit).buffer()),
+    // A proc's hit, as CombatState.method_72 fires it: the power that set it off in the first optional id.
+    procHit: (target, source, damage, power, origin, crit) =>
+        frame(0x0a, new BitWriter().uint(target).uint(source).sint(damage).uint(power).bool(true).uint(origin).bool(true).uint(2).bool(crit).buffer()),
     dot: (target, source, power, amount) => frame(0x79, new BitWriter().uint(target).uint(source).uint(power).sint(amount).raw(0, 5).buffer()),
     spawn: (id, name, isPlayer, team) => {
         const w = new BitWriter().uint(id).str(name).raw(isPlayer ? 1 : 0, 1);
@@ -233,9 +236,9 @@ async function main() {
         assert.strictEqual(table.get(984).scaling.dot.stat, 'attack', 'only the current rank counts, not "Next rank"');
         assert.strictEqual(table.statFor(984, 'dot'), 'expertise', 'every DoT tick scales with Expertise');
         assert.strictEqual(table.statFor(3, 'dot'), 'expertise');
-        assert.strictEqual(table.statFor(500, 'hit'), 'expertise', 'elemental without a Stats line');
+        assert.strictEqual(table.statFor(500, 'hit'), 'attack', 'a Fire spell hit is Attack too: BaseDamageMult x meleeDamage');
         assert.strictEqual(table.statFor(3, 'hit'), 'attack');
-        assert.strictEqual(table.statFor(999999, 'hit'), 'unknown');
+        assert.strictEqual(table.statFor(500, 'dot'), 'expertise');
         assert.strictEqual(parseScaling('[Stats: 3x heal]').heal, true);
     });
 
@@ -398,6 +401,170 @@ async function main() {
         assert.strictEqual(s.rotation.entries[0].damage, 500);
     });
 
+    console.log('Spells by the game rules');
+    {
+        const live = new PowerTable(JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src', 'dps', 'powers-snapshot.json'), 'utf8')));
+        const id = (name) => {
+            for (const p of live.byId.values()) if (p.name === name) return p.id;
+            throw new Error('no power ' + name);
+        };
+        const fight = () => {
+            let now = 0;
+            const m = new DpsMeter({ powers: live, now: () => now });
+            m.start();
+            return { m, tick: (ms) => (now += ms || 100) };
+        };
+        const rowsOf = (s) => s.equipped.concat(s.others);
+        const row = (s, label) => rowsOf(s).find((r) => r.label === label);
+        const otherLabels = (s) => s.others.map((r) => r.label);
+
+        await check("Viperblade: ProcCriticalHit is Charon's Blades, on the hotbar; Crimson Butterfly in Charon's form stays Crimson", () => {
+            const { m, tick } = fight();
+            const proc = id('ProcCriticalHit');
+            m.recordCast({ powerId: id('SeekingBlades10') });
+            tick();
+            m.recordCast({ powerId: id('SeekingBladesAttack10') }); // its opening attack: part of the cast
+            m.recordDamage({ kind: 'hit', powerId: proc, originId: id('SeekingBladesAttack10'), damage: 9000, crit: true });
+            tick();
+            m.recordCast({ powerId: id('RapierMelee'), combo: { isMelee: true, id: 1 } });
+            m.recordDamage({ kind: 'hit', powerId: proc, originId: id('RapierMelee'), damage: 4000, crit: true });
+            tick();
+            m.recordCast({ powerId: id('ShadowBlade10') });
+            m.recordDamage({ kind: 'hit', powerId: proc, originId: id('ShadowBlade10'), damage: 20000, crit: true });
+            m.recordDamage({ kind: 'hit', powerId: proc, originId: id('ShadowBlade10'), damage: 21000, crit: true });
+            tick();
+            m.recordDamage({ kind: 'hit', powerId: proc, damage: 1000 }); // no origin: still Charon's
+            m.recordCast({ powerId: id('EndSeekingBlades') });
+            const s = m.snapshot();
+            const charon = row(s, "Charon's Blades");
+            const crimson = row(s, 'Crimson Butterfly');
+            assert.deepStrictEqual([charon.damage, charon.casts, charon.hits, charon.slot], [14000, 1, 3, 6]);
+            assert.deepStrictEqual([crimson.damage, crimson.casts, crimson.hits, crimson.slot], [41000, 1, 2, 5]);
+            assert.ok(s.equipped.includes(charon) && s.equipped.includes(crimson), 'both on the hotbar');
+            assert.deepStrictEqual(otherLabels(s), [], 'no Proc Critical Hit under Other damage');
+            assert.strictEqual(s.totals.casts, 3, 'Charon, the melee attack and Crimson; its opening attack and its end are not casts');
+            assert.strictEqual(s.rotation.text, 's6 MA1 s5', 'the melee hit in Charon form counts for its MA run');
+            assert.deepStrictEqual(s.byStat, { attack: 55000, expertise: 0, unknown: 0 });
+        });
+
+        await check('Devour and Shadow Scythe: no MonsterProc row, no extra cast; Black Miasma: no empty Shadow Tendril', () => {
+            const { m, tick } = fight();
+            m.recordCast({ powerId: id('Devour10') });
+            m.recordCast({ powerId: id('ProcDevour') }); // its heal, fired by the client
+            m.recordDamage({ kind: 'hit', powerId: id('Devour10'), damage: 5000 });
+            tick();
+            m.recordCast({ powerId: id('Reaper') });
+            m.recordCast({ powerId: id('ProcDevour') });
+            m.recordDamage({ kind: 'hit', powerId: id('Reaper'), damage: 3000 });
+            tick();
+            m.recordCast({ powerId: id('ShadowTendrilDash10') });
+            m.recordCast({ powerId: id('ShadowTendril10') }); // the cloud it leaves: part of the cast, no damage
+            m.recordDamage({ kind: 'hit', powerId: id('ShadowTendrilDash10'), damage: 2000 });
+            const s = m.snapshot();
+            assert.deepStrictEqual(otherLabels(s), []);
+            assert.deepStrictEqual(['Devour', 'Shadow Scythe', 'Black Miasma'].map((l) => row(s, l).casts), [1, 1, 1]);
+            assert.strictEqual(s.totals.casts, 3);
+            assert.strictEqual(s.rotation.text.split(' ').length, 3);
+        });
+
+        await check("Shadow Legion: its clones' Sword Melee and monster attacks count for Shadow Legion; your own melee is \"Melee\"", () => {
+            const { m, tick } = fight();
+            const legion = id('ShadowLegion10');
+            m.recordCast({ powerId: legion });
+            tick();
+            const clone = (n) => ({ name: 'ShadowLegionClone' + n + '10', powerId: legion });
+            m.recordDamage({ kind: 'hit', powerId: id('SwordMelee'), damage: 1500, summon: clone('') });
+            m.recordDamage({ kind: 'hit', powerId: id('SkeletonCyclone'), damage: 700, summon: clone('Two') });
+            // A clone the 0x08 didn't name a power for: found by its entity type.
+            m.recordDamage({ kind: 'hit', powerId: id('FalseTendrilDash'), damage: 800, summon: { name: 'ShadowLegionCloneThree10', powerId: 0 } });
+            m.recordDamage({ kind: 'hit', powerId: id('ShadowLegionExplode10'), damage: 6000, summon: clone('') });
+            tick();
+            m.recordCast({ powerId: id('RapierMelee'), combo: { isMelee: true, id: 1 } });
+            m.recordDamage({ kind: 'hit', powerId: id('RapierMelee'), damage: 900 });
+            const s = m.snapshot();
+            const sl = row(s, 'Shadow Legion');
+            assert.deepStrictEqual([sl.damage, sl.hits, sl.summonDamage, sl.casts, sl.slot], [9000, 4, 9000, 1, 5]);
+            assert.deepStrictEqual(otherLabels(s), ['Melee'], 'no Sword Melee or Monster rows; Dagger Melee reads Melee');
+            assert.strictEqual(row(s, 'Melee').damage, 900);
+            assert.strictEqual(s.rotation.entries[0].damage, 9000, "the clones' damage goes to the Shadow Legion cast");
+        });
+
+        await check('the mount is never part of the fight: Summon Mount and Dismount', () => {
+            const { m, tick } = fight();
+            m.recordCast({ powerId: id('RapierMelee'), combo: { isMelee: true, id: 1 } });
+            m.recordDamage({ kind: 'hit', powerId: id('RapierMelee'), damage: 100 });
+            tick();
+            m.recordCast({ powerId: id('SummonMount') });
+            m.recordCast({ powerId: id('Dismount') });
+            m.recordCast({ powerId: id('RapierMelee'), combo: { isMelee: true, id: 2 } });
+            m.recordDamage({ kind: 'hit', powerId: id('RapierMelee'), damage: 100 });
+            const s = m.snapshot();
+            assert.ok(!rowsOf(s).some((r) => /Wolf Bear|Dismount|Mount/.test(r.label)));
+            assert.strictEqual(s.totals.casts, 2);
+            assert.strictEqual(s.rotation.text, 'MA2', 'the melee run goes on across it');
+        });
+
+        await check('Frostbringer: Frost Armor powers and End Hailstone Embrace are Hailstone Embrace; its basic attacks stay MA and RA', () => {
+            const { m, tick } = fight();
+            const hail = id('HailstoneEmbrace10');
+            m.recordCast({ powerId: hail });
+            tick();
+            m.recordCast({ powerId: id('FrostArmorRanged10'), combo: { isMelee: false, id: 1 } });
+            m.recordDamage({ kind: 'hit', powerId: id('FrostArmorIce10'), damage: 3000 }); // the ice it leaves
+            m.recordDamage({ kind: 'hit', powerId: id('FrostArmorIce10'), damage: 3000 });
+            tick();
+            m.recordCast({ powerId: id('FrostArmorRanged10'), combo: { isMelee: false, id: 2 } });
+            m.recordDamage({ kind: 'hit', powerId: id('FrostArmorIce10'), damage: 3000 });
+            tick();
+            m.recordCast({ powerId: id('FrostArmorMelee9'), combo: { isMelee: true, id: 1 } });
+            m.recordDamage({ kind: 'hit', powerId: id('FrostArmorMelee9'), damage: 5000 });
+            m.recordDamage({ kind: 'dot', powerId: id('FrostArmorMelee9'), damage: 200 });
+            tick();
+            m.recordCast({ powerId: id('EndFrostArmor') });
+            const s = m.snapshot();
+            const he = row(s, 'Hailstone Embrace');
+            assert.deepStrictEqual([he.damage, he.casts, he.hits, he.dotDamage, he.slot], [14200, 1, 4, 200, 6]);
+            assert.deepStrictEqual(otherLabels(s), [], 'no Frost Armor rows, no End Hailstone Embrace');
+            assert.strictEqual(s.rotation.text, 's6 RA3 MA1');
+            assert.strictEqual(s.totals.casts, 4);
+            assert.deepStrictEqual(he.byStat, { attack: 14000, expertise: 200, unknown: 0 });
+        });
+
+        await check('Frostbringer scaling: Bitter Blade, Frozen Ward and Frigid Comet hit with Attack; Chilblains ticks from Frigid Comet are Expertise, in Frigid Comet', () => {
+            const { m } = fight();
+            m.recordDamage({ kind: 'hit', powerId: id('BitterBlade10'), damage: 4000 });
+            m.recordDamage({ kind: 'hit', powerId: id('FrozenWard10'), damage: 3000 });
+            m.recordDamage({ kind: 'hit', powerId: id('FrigidComet10'), damage: 8000 });
+            // Chilblains: AddBuff(Chilblains, caster, caster.magicDamage, FrigidComet's powerID)
+            m.recordDamage({ kind: 'dot', powerId: id('FrigidComet10'), damage: 600 });
+            const s = m.snapshot();
+            assert.deepStrictEqual(row(s, 'Bitter Blade').byStat, { attack: 4000, expertise: 0, unknown: 0 });
+            assert.deepStrictEqual(row(s, 'Frozen Ward').byStat, { attack: 3000, expertise: 0, unknown: 0 });
+            const fc = row(s, 'Frigid Comet');
+            assert.deepStrictEqual([fc.damage, fc.dotDamage, fc.byStat.attack, fc.byStat.expertise], [8600, 600, 8000, 600]);
+        });
+
+        await check('a glancing blow counts for the power that hit; other damage lists only rows with damage', () => {
+            const { m } = fight();
+            m.recordCast({ powerId: id('ShadowBlade10') });
+            m.recordDamage({ kind: 'hit', powerId: id('ProcGlancingBlow'), originId: id('ShadowBlade10'), damage: 500 });
+            m.recordCast({ powerId: id('PetCrow') }); // a cast that never dealt damage
+            const s = m.snapshot();
+            assert.strictEqual(row(s, 'Crimson Butterfly').damage, 500);
+            assert.deepStrictEqual(otherLabels(s), []);
+        });
+
+        await check('the relay hands the meter the power a proc came from', () => {
+            const t = new CombatTracker('test');
+            const seen = [];
+            t.on('damage', (d) => seen.push(d));
+            t.fromClient(0x08, pkt.fullUpdate(12, 'ksq', { isPlayer: true }).subarray(4));
+            t.fromClient(0x0a, pkt.procHit(301, 12, 25000, 1447, 1139, true).subarray(4));
+            t.fromClient(0x0a, pkt.hit(301, 12, 900, 969, false).subarray(4));
+            assert.deepStrictEqual(seen.map((d) => [d.powerId, d.originId]), [[1447, 1139], [969, undefined]]);
+        });
+    }
+
     console.log('Export');
     await check('JSON, CSV and summary agree with the meter', () => {
         let now = 0;
@@ -420,7 +587,7 @@ async function main() {
         assert.strictEqual(j.spells[0].casts, 2);
         assert.strictEqual(j.distribution.byStat.attack.share, 0.75);
         assert.strictEqual(j.distribution.byKind.dot.damage, 1000);
-        assert.deepStrictEqual(j.hits[0], { atMs: 0, powerId: 993, damage: 3000, crit: true, kind: 'hit', target: 'Goblin', summon: null });
+        assert.deepStrictEqual(j.hits[0], { atMs: 0, powerId: 993, damage: 3000, crit: true, kind: 'hit', target: 'Goblin', summon: null, spell: 'PoisonStrike' });
         assert.deepStrictEqual(j.rotation.steps, ['PoisonStrike', 'PoisonStrike']);
         assert.strictEqual(j.rotation.casts[1].damage, 4000, 'both hits and the tick go to the latest cast of the power');
         const csv = exporter.toCsv(m.report(), meta).split('\r\n');

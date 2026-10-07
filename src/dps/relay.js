@@ -70,7 +70,12 @@ class CombatTracker extends EventEmitter {
             case P.PKT.POWER_HIT: {
                 const h = P.parsePowerHit(payload);
                 if (h.damage > 0 && this.isOwnSource(h.sourceId) && !this.isFriendlyTarget(h.targetId)) {
-                    this.emit('damage', this.damageEvent('hit', h.sourceId, h.powerId, h.damage, h.isCrit, h.targetId));
+                    const ev = this.damageEvent('hit', h.sourceId, h.powerId, h.damage, h.isCrit, h.targetId);
+                    // A proc's hit (Charon's Blades' ProcCriticalHit, a glancing blow) names the power
+                    // that set it off in its first optional id: ActivePower.var_249, written by
+                    // LinkUpdater.method_1092. See DpsMeter.resolve.
+                    if (h.animOverrideId && h.animOverrideId !== h.powerId) ev.originId = h.animOverrideId;
+                    this.emit('damage', ev);
                 }
                 break;
             }

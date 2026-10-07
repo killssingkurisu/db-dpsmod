@@ -578,7 +578,7 @@ class Overlay {
         el.legend.innerHTML = legend;
         el.kinds.textContent = t.damage
             ? 'Over time ' + pct(t.dotDamage, t.damage) + ' of damage. Crits ' + pct(t.critDamage, t.damage) + ' of damage.'
-            : 'Hits split by Attack and Expertise scaling, from each spell’s stats.';
+            : 'Direct hits scale with Attack, damage over time with Expertise.';
         const ig = m.ignored;
         el.ignored.hidden = !(ig.hits && m.state !== 'running');
         el.ignored.textContent = ig.hits ? int(ig.hits) + ' hit' + (ig.hits === 1 ? '' : 's') + ' (' + short(ig.damage) + ' damage) landed while the timer was stopped and weren’t counted.' : '';
@@ -684,7 +684,7 @@ class Overlay {
         const m = view.meter;
         const list = this.el.spells;
         const equipped = m.equipped || [];
-        const others = (m.others || []).filter((r) => r.damage > 0 || r.casts > 0);
+        const others = (m.others || []).filter((r) => r.damage > 0);
         const maxDamage = Math.max(1, ...equipped.map((r) => r.damage), ...others.map((r) => r.damage));
         const scan = view.scan;
 

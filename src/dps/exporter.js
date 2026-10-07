@@ -118,6 +118,7 @@ function toJson(report, meta) {
     const total = s.totals.damage;
     const rotation = report.rotation || [];
     const share = (n) => (total ? round(n / total, 4) : 0);
+    const spellOf = new Map(report.rows.map((r) => [r.key, spellKey(r)]));
     return {
         format: 'dbb-dps',
         version: 2,
@@ -168,11 +169,12 @@ function toJson(report, meta) {
         },
         targets: report.targets.map((t) => ({ name: t.name, damage: t.damage, hits: t.hits, share: share(t.damage) })),
         damagePerSecond: report.timeline,
-        hits: report.hits.map((h) => ({ atMs: h[0], powerId: h[1], damage: h[2], crit: Boolean(h[3]), kind: h[4], target: h[5], summon: h[6] || null })),
+        hits: report.hits.map((h) => ({ atMs: h[0], powerId: h[1], damage: h[2], crit: Boolean(h[3]), kind: h[4], target: h[5], summon: h[6] || null, spell: spellOf.get(h[7]) || null })),
         notes: [
             'Damage is what your game client sent to the server for each hit (packet 0x0A) and DoT tick (packet 0x79), including DoT ticks on the house training dummies, which the meter reads but never forwards. The server can add to it afterwards (the Soulthief passive, admin damage scaling), which is not included.',
             'rotation.casts lists the casts (packet 0x09) in order while the timer ran: each hotbar spell cast (slot 1-6 = keys 1, 2, 3, 4, E, Q), runs of basic attacks in a row as one entry (kind melee or ranged, label MA<hits> (melee attack) or RA<hits> (ranged attack), casts = how many; a spell is labelled s<slot>, s1-s6 for keys 1, 2, 3, 4, E, Q), and any other power that dealt damage. Each entry is credited with the hits and DoT ticks of its power until that power is cast again. rotation.text is the same order as shown in the Rotation window ("MA2 s2 s3 RA1 s4 s1"). rotation.steps is the same order as DPS Calculator combo steps, one "basic" per basic attack.',
-            'Scaling: a direct hit counts toward the stat in its spell\'s Stats line ("1.49x attack"); every DoT tick counts toward Expertise, which the game puts into each DoT when it lands.'
+            'Scaling, as the game client computes damage: every direct hit is BaseDamageMult x Attack, whatever its element (Bitter Blade, Frozen Ward and Frigid Comet included); every DoT tick carries your Expertise from when it landed (Chilblains from Frigid Comet included).',
+            'Spells: a summon\'s damage counts for the skill that summoned it (Shadow Legion\'s clones); Charon\'s Blades\' ProcCriticalHit counts for Charon\'s Blades, except a hotbar spell\'s hit in its form, which stays with that spell (Crimson Butterfly); a skill\'s other powers count for it (Hailstone Embrace\'s Frost Armor, Black Miasma\'s Shadow Tendril). hits[].spell names the spell each hit counted for. The mount and the procs the client fires by itself are not casts.'
         ]
     };
 }

@@ -34,7 +34,7 @@ function decodeEntities(s) {
 
 /**
  * Raw records, compact: [id, name, base, display, damageType, mana, cooldownMs, description,
- * isMonster, targetMethod, powerGroup].
+ * isMonster, targetMethod, powerGroup, spawnedMonsters].
  */
 function parsePowerXml(xml, isMonster) {
     const out = [];
@@ -57,7 +57,8 @@ function parsePowerXml(xml, isMonster) {
             tag(m[2], 'Description'),
             isMonster ? 1 : 0,
             tag(m[2], 'TargetMethod'),
-            tag(m[2], 'PowerGroup')
+            tag(m[2], 'PowerGroup'),
+            tag(m[2], 'SpawnedMonsters')
         ]);
     }
     return out;
@@ -87,6 +88,12 @@ function parseAbilityXml(xml) {
     return out;
 }
 
+/**
+ * The data set's layout version. 2 added SpawnedMonsters (which spell a summon belongs to); a
+ * cached table older than this is rebuilt from Game.swz.
+ */
+const DATA_VERSION = 2;
+
 /** The compact data set a table is built from: what powers-snapshot.json holds. */
 function dataFromSwz(buf, source) {
     const chunks = unpackSwz(buf);
@@ -95,7 +102,7 @@ function dataFromSwz(buf, source) {
         throw new Error('Game.swz has no PlayerPowerTypes');
     }
     return {
-        version: 1,
+        version: DATA_VERSION,
         source: source || 'Game.swz',
         builtAt: new Date().toISOString(),
         powers: parsePowerXml(player, false).concat(parsePowerXml(chunkByRoot(chunks, 'MonsterPowerTypes'), true)),
@@ -143,13 +150,32 @@ function prettify(name) {
         .trim();
 }
 
+/** How a basic attack picks its target: melee combos and punches, thrown and shot projectiles. */
+const MELEE_METHOD = /^(MeleeCombo|MeleePunch)$/;
+const BASIC_METHOD = /^(MeleeCombo|MeleePunch|ProjectilePlayer|ProjectileCombo)$/;
+
+/**
+ * Powers that only ever ride on another power's hit: Charon's Blades turns every hit into a
+ * ProcCriticalHit, a glancing blow halves one into a ProcGlancingBlow, Devour and Shadow Scythe
+ * heal through ProcDevour, gear and runes fire their own. The client fires them itself
+ * (CombatState.method_72); they are never a key the player pressed.
+ */
+function isProc(name, display) {
+    return /^(Proc|SigilProc)/.test(name) || /MonsterProc/.test(display || '');
+}
+
+/** The mount: Summon Mount (whatever its display name says) and Dismount. No damage, no rotation. */
+function isMount(name, targetMethod) {
+    return name === 'SummonMount' || name === 'Dismount' || targetMethod === 'Mount';
+}
+
 class PowerTable {
     constructor(data) {
         this.data = data;
         this.byId = new Map();
         this.abilities = data.abilities || {};
         for (const r of data.powers || []) {
-            const [id, name, base, display, damageType, mana, cooldown, description, monster, targetMethod, powerGroup] = r;
+            const [id, name, base, display, damageType, mana, cooldown, description, monster, targetMethod, powerGroup, spawned] = r;
             const group = base || name;
             // The ability a power belongs to. Usually its own base name (PoisonStrike10 ->
             // PoisonStrike); a skill's follow-up powers name it in PowerGroup instead: Mist Walk's
@@ -170,12 +196,18 @@ class PowerTable {
                 rank = Number.isFinite(n) ? n : 0;
             }
             const scaling = parseScaling(description);
+            // Monster powers are all called "***Monster***" in the data, procs "***MonsterProc***".
+            const placeholder = /^\*+.*\*+$/.test(display || '');
+            const manaFree = /^0(,|$)/.test(String(mana || '').trim());
+            const onHotbar = Boolean(abilityKey && this.abilities[abilityKey] && this.abilities[abilityKey][2] > 0);
+            const basicMelee = !monster && !onHotbar && manaFree && MELEE_METHOD.test(targetMethod || '');
             this.byId.set(id, {
                 id,
                 name,
                 group,
                 rank,
-                label: display || prettify(name) || name,
+                // Your own melee basic attack is just "Melee" (Dagger Melee, Sword Melee, Staff Melee, ...).
+                label: basicMelee ? 'Melee' : (!placeholder && display) || prettify(name) || name,
                 damageType: damageType || '',
                 mana: String(mana || ''),
                 cooldownMs: cooldown,
@@ -186,18 +218,65 @@ class PowerTable {
                 // ProjectilePlayer / ProjectileCombo for ranged ones, Self, RangedAoE, ...
                 targetMethod: targetMethod || '',
                 powerGroup: powerGroup || '',
+                spawned: String(spawned || '')
+                    .split(',')
+                    .map((x) => x.trim())
+                    .filter(Boolean),
                 abilityKey,
                 followUp: Boolean(abilityKey && abilityKey !== group),
-                ability: abilityKey ? this.abilities[abilityKey] : null
+                ability: abilityKey ? this.abilities[abilityKey] : null,
+                basicMelee,
+                proc: !monster && isProc(name, display),
+                mount: isMount(name, targetMethod),
+                basicOverride: false
             });
         }
+
+        // A hotbar skill's other powers often share its PowerGroup under another name: Hailstone
+        // Embrace (PowerGroup FrostArmor) owns Frost Armor Ice, Frost Armor Melee / Ranged (the
+        // basic attacks it enchants) and End Hailstone Embrace; Black Miasma (ShadowTendrilDash,
+        // PowerGroup ShadowTendril) owns the Shadow Tendril cloud. Only groups that belong to one
+        // hotbar skill count (a basic-attack ability such as Frost Bolt keeps its Iceball).
+        const owner = new Map();
+        for (const p of this.byId.values()) {
+            if (!p.abilityKey || p.followUp || !p.powerGroup || !(p.ability && p.ability[2] > 0)) continue;
+            const prev = owner.get(p.powerGroup);
+            owner.set(p.powerGroup, prev === undefined || prev === p.abilityKey ? p.abilityKey : null);
+        }
+        for (const p of this.byId.values()) {
+            if (p.abilityKey || p.monster || p.proc || p.mount || !p.powerGroup) continue;
+            const key = owner.get(p.powerGroup);
+            if (!key) continue;
+            p.abilityKey = key;
+            p.followUp = true;
+            p.ability = this.abilities[key];
+            p.basicMelee = false;
+        }
+        for (const p of this.byId.values()) {
+            // A skill's version of the basic attacks (Hailstone Embrace's Frost Armor Melee and
+            // Ranged): pressed like any basic attack, damage for the skill.
+            p.basicOverride = Boolean(p.followUp && p.ability && p.ability[2] > 0 && BASIC_METHOD.test(p.targetMethod));
+        }
+
         // An ability's name, from its own powers (follow-ups often have none, or another).
         const names = {};
         for (const p of this.byId.values()) {
             if (p.abilityKey && !p.followUp && !names[p.abilityKey]) names[p.abilityKey] = p.label;
         }
+        this.abilityNames = names;
         for (const p of this.byId.values()) {
             p.abilityLabel = p.abilityKey ? names[p.abilityKey] || p.label : p.label;
+        }
+
+        // Which skill each summon belongs to: Shadow Legion spawns ShadowLegionClone10, ...
+        this.spawnedBy = new Map();
+        for (const p of this.byId.values()) {
+            if (!p.abilityKey) continue;
+            for (const m of p.spawned) {
+                if (!this.spawnedBy.has(m)) this.spawnedBy.set(m, p.abilityKey);
+                const bare = m.replace(/\d+$/, '');
+                if (!this.spawnedBy.has(bare)) this.spawnedBy.set(bare, p.abilityKey);
+            }
         }
     }
 
@@ -205,30 +284,51 @@ class PowerTable {
         return this.byId.get(id) || null;
     }
 
+    /** An ability's display name ("SeekingBlades" -> "Charon's Blades"). */
+    abilityLabel(key) {
+        return this.abilityNames[key] || prettify(key);
+    }
+
+    /** An ability's hotbar slot (AbilityTypes HotbarLocation; 0 for basic-attack abilities). */
+    slotOf(key) {
+        const a = this.abilities[key];
+        return a ? a[2] || 0 : 0;
+    }
+
+    /** The power that stands for an ability: its own power of the given rank, else its highest. */
+    mainPower(key, rank) {
+        let best = null;
+        for (const p of this.byId.values()) {
+            if (p.abilityKey !== key || p.followUp) continue;
+            if (rank && p.rank === rank) return p;
+            if (!best || p.rank > best.rank) best = p;
+        }
+        return best;
+    }
+
     /**
-     * Which stat a hit of this power scales with. A direct hit takes the first "Nx stat" term of
-     * the Stats line; without one, physical powers scale with Attack and everything elemental
-     * (Fire, Ice, Holy, Dark, ...) with Expertise. A DoT tick always scales with Expertise: the
-     * client snapshots the caster's magicDamage (Expertise) into every buff a power puts on its
-     * target (CombatState: AddBuff(type, caster, caster.magicDamage * (1 + mods), powerId)),
-     * whatever the power's hit scales with.
+     * The hotbar skill a summon's damage belongs to: the power that summoned it (the summon's 0x08
+     * names it; Entity.var_99), else the skill whose SpawnedMonsters list its entity type.
+     */
+    summonAbility(summon) {
+        if (!summon) return '';
+        const by = summon.powerId ? this.get(summon.powerId) : null;
+        if (by && by.abilityKey && !by.monster) return by.abilityKey;
+        const name = String(summon.name || '');
+        return this.spawnedBy.get(name) || this.spawnedBy.get(name.replace(/\d+$/, '')) || '';
+    }
+
+    /**
+     * Which stat a hit scales with, by the client's own arithmetic (CombatState.method_1192): a
+     * direct hit is BaseDamageMult x meleeDamage, that is Attack, whatever its DamageType (Ice,
+     * Fire and Dark spells included: Bitter Blade, Frozen Ward, Frigid Comet). A DoT tick is
+     * Expertise: every buff a power puts on its target carries the caster's magicDamage
+     * (AddBuff(type, caster, caster.magicDamage, powerId)), Chilblains from Frigid Comet too.
+     * The data agrees: of its Stats terms, every direct one is "Nx attack" and every per-second one
+     * "Nx Expertise/s".
      */
     statFor(id, kind) {
-        if (kind === 'dot') {
-            return 'expertise';
-        }
-        const p = this.byId.get(id);
-        if (!p) {
-            return 'unknown';
-        }
-        const term = p.scaling.hit;
-        if (term) {
-            return term.stat;
-        }
-        if (!p.damageType) {
-            return 'unknown';
-        }
-        return /^physical$/i.test(p.damageType) ? 'attack' : 'expertise';
+        return kind === 'dot' ? 'expertise' : 'attack';
     }
 
     get size() {
@@ -236,4 +336,4 @@ class PowerTable {
     }
 }
 
-module.exports = { PowerTable, dataFromSwz, parseScaling, parsePowerXml, parseAbilityXml, prettify };
+module.exports = { PowerTable, dataFromSwz, parseScaling, parsePowerXml, parseAbilityXml, prettify, isProc, isMount, DATA_VERSION };

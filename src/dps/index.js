@@ -10,7 +10,7 @@ const { RelayHub } = require('./relay');
 const { WebProxy } = require('./httpProxy');
 const swfpatch = require('./swfpatch');
 const { DpsMeter } = require('./meter');
-const { PowerTable, dataFromSwz } = require('./powers');
+const { PowerTable, dataFromSwz, DATA_VERSION } = require('./powers');
 const { SpellScanStore } = require('./spellScans');
 const exporter = require('./exporter');
 
@@ -312,6 +312,9 @@ class DpsOverlay {
         let data = null;
         try {
             data = JSON.parse(fs.readFileSync(this.cachePath(), 'utf8'));
+            // A cache from an older layout lacks fields the meter now reads (which skill a summon
+            // belongs to); the bundled table stands in until the game's own Game.swz loads.
+            if (!data || (data.version || 1) < DATA_VERSION || !Array.isArray(data.powers)) throw new Error('old cache');
             this.powersInfo = { source: 'cached ' + (data.source || ''), count: data.powers.length };
         } catch (_e) {
             data = null;

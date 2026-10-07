@@ -1,6 +1,7 @@
 'use strict';
 
 const { EventEmitter } = require('events');
+const { prettify } = require('./powers');
 
 /**
  * The fight being measured: a stopwatch, and every hit and cast that arrived while it ran.
@@ -19,6 +20,10 @@ const CAST_WINDOW_MS = 60000;
 const STATS = ['attack', 'expertise', 'unknown'];
 /** The game's hotbar locations (AbilityTypes HotbarLocation) and the keys that fire them. */
 const SLOT_KEYS = { 1: '1', 2: '2', 3: '3', 4: '4', 5: 'E', 6: 'Q' };
+/** Charon's Blades (SeekingBlades): while it is up, every hit arrives as a ProcCriticalHit. */
+const CHARON = 'SeekingBlades';
+/** Procs that are the hit itself, made smaller: they count for the power that hit. */
+const ORIGIN_PROCS = new Set(['ProcGlancingBlow']);
 
 /** Up to two capitals of a name, for a power that has no hotbar key: "Poison Strike" -> "PS". */
 function initials(label) {
@@ -57,10 +62,13 @@ class DpsMeter extends EventEmitter {
         this.powers = powers;
         // Labels and scaling come from the table, so rows built before it changed are refreshed.
         for (const row of this.rows.values()) {
-            const p = this.powers && this.powers.get(row.lastPowerId);
-            if (p && !row.summon) {
-                row.label = p.ability && p.ability[2] > 0 ? p.abilityLabel : p.label;
+            if (row.summon || !this.powers) continue;
+            if (row.ability) {
+                row.label = this.powers.abilityLabel(row.ability);
+                continue;
             }
+            const p = this.powers.get(row.lastPowerId);
+            if (p) row.label = p.label;
         }
         this.emit('change');
     }
@@ -139,25 +147,37 @@ class DpsMeter extends EventEmitter {
         this.rotation = []; // every cast, in order: see recordCast
         this.rotationSeq = 0;
         this.lastCast = new Map(); // powerId -> its latest rotation entry
-        this.lastByKey = new Map(); // spell row key -> its latest rotation entry
+        this.lastByKey = new Map(); // spell row key -> its latest cast
+        this.lastOverride = new Map(); // skill -> its latest run of enchanted basic attacks
         this.emit('change');
     }
 
     /* ---------- input ---------- */
 
-    rowFor(powerId, summonName) {
-        const p = this.powers ? this.powers.get(powerId) : null;
+    /**
+     * The spell table row for a power. opts.ability puts it in that hotbar skill's row (a summon's
+     * hits in Shadow Legion's, a ProcCriticalHit in Charon's Blades'); opts.summonName gives a
+     * summon no skill could be found for a row of its own.
+     */
+    rowFor(powerId, opts) {
+        const o = opts || {};
+        const P = this.powers;
+        const p = P ? P.get(powerId) : null;
+        let ability = o.ability || '';
+        if (!ability && p && p.abilityKey && p.ability && p.ability[2] > 0) ability = p.abilityKey;
         let key;
         let label;
-        if (p) {
-            // Hotbar abilities by their base power (every rank in one row). Everything else
-            // (basic attacks, rune procs, pets) by its name, so two "Sword Melee" powers share a row.
-            const hotbar = p.ability && p.ability[2] > 0;
-            key = hotbar ? p.abilityKey : 'name:' + p.label;
-            label = hotbar ? p.abilityLabel : p.label;
-        } else if (summonName) {
-            key = 'summon:' + summonName;
-            label = summonName;
+        if (ability) {
+            // Hotbar abilities by their base power (every rank in one row).
+            key = ability;
+            label = P ? P.abilityLabel(ability) : ability;
+        } else if (o.summonName) {
+            label = prettify(o.summonName) || o.summonName;
+            key = 'summon:' + label;
+        } else if (p) {
+            // Everything else (basic attacks, rune procs) by its name, so two "Melee" powers share a row.
+            key = 'name:' + p.label;
+            label = p.label;
         } else {
             key = 'power:' + powerId;
             label = 'Power #' + powerId;
@@ -167,6 +187,7 @@ class DpsMeter extends EventEmitter {
             row = {
                 key,
                 label,
+                ability,
                 ranks: new Set(),
                 powerIds: new Set(),
                 lastPowerId: powerId,
@@ -183,22 +204,63 @@ class DpsMeter extends EventEmitter {
                 byStat: emptyStats(),
                 firstAt: 0,
                 lastAt: 0,
-                summon: !p && Boolean(summonName),
-                monster: Boolean(p && p.monster)
+                summon: !ability && Boolean(o.summonName),
+                monster: Boolean(!ability && p && p.monster)
             };
             this.rows.set(key, row);
         }
         row.lastPowerId = powerId;
         row.powerIds.add(powerId);
-        if (p && p.rank) {
+        if (p && p.rank && (!ability || p.abilityKey === ability)) {
             row.ranks.add(p.rank);
         }
         return row;
     }
 
+    /**
+     * Where a damage event goes, by the game's own rules:
+     *
+     *  - a summon's hits and ticks count for the skill that summoned it: the summon's 0x08 names
+     *    the summoning power (Entity.var_99), else its entity type is in a skill's
+     *    SpawnedMonsters (Shadow Legion's clones and their Sword Melee and monster attacks);
+     *  - a ProcCriticalHit is Charon's Blades: while it is up the client turns every hit into one,
+     *    worth the hit plus Charon's bonus (CombatState.method_1192), and the hit packet names the
+     *    power that hit (its first optional id, ActivePower.var_249). A hotbar spell's hit stays
+     *    with that spell (Crimson Butterfly cast in Charon's form is Crimson Butterfly damage);
+     *    the rest, Charon's form's attacks, are Charon's Blades;
+     *  - a glancing blow is the hit itself, halved: it counts for the power that hit.
+     *
+     * Returns the power whose row gets it (rowPowerId, or the skill in ability), and the power
+     * whose latest cast in the rotation gets it (entryPowerId).
+     */
+    resolve(e) {
+        const P = this.powers;
+        const out = { rowPowerId: e.powerId, ability: '', summonName: '', entryPowerId: e.powerId };
+        if (!P) {
+            if (e.summon) out.summonName = e.summon.name || 'Summon';
+            return out;
+        }
+        if (e.summon) {
+            const key = P.summonAbility(e.summon);
+            if (key) return Object.assign(out, { ability: key, entryPowerId: e.summon.powerId || e.powerId });
+            return Object.assign(out, { summonName: e.summon.name || 'Summon' });
+        }
+        const p = P.get(e.powerId);
+        const origin = e.originId && e.originId !== e.powerId ? P.get(e.originId) : null;
+        if (p && p.name === 'ProcCriticalHit') {
+            const own = origin && origin.abilityKey && origin.abilityKey !== CHARON && !origin.basicOverride && P.slotOf(origin.abilityKey) > 0;
+            return Object.assign(out, { ability: own ? origin.abilityKey : CHARON, entryPowerId: origin ? origin.id : e.powerId });
+        }
+        if (p && origin && ORIGIN_PROCS.has(p.name) && !origin.monster) {
+            return Object.assign(out, { rowPowerId: origin.id, entryPowerId: origin.id });
+        }
+        return out;
+    }
+
     /** Called for each damage event the relay attributes to the player. */
-    recordDamage({ kind, powerId, damage, crit, targetName, summon }) {
-        const amount = Math.round(Math.abs(Number(damage) || 0));
+    recordDamage(e) {
+        const { kind, crit, targetName, summon } = e;
+        const amount = Math.round(Math.abs(Number(e.damage) || 0));
         if (!amount) {
             return;
         }
@@ -212,8 +274,9 @@ class DpsMeter extends EventEmitter {
             return;
         }
         const t = this.elapsedMs();
-        const row = this.rowFor(powerId, summon ? summon.name : '');
-        const stat = this.powers ? this.powers.statFor(powerId, kind) : 'unknown';
+        const where = this.resolve(e);
+        const row = this.rowFor(where.rowPowerId, { ability: where.ability, summonName: where.summonName });
+        const stat = this.powers ? this.powers.statFor(where.rowPowerId, kind) : 'unknown';
         const s = STATS.includes(stat) ? stat : 'unknown';
 
         row.damage += amount;
@@ -255,18 +318,16 @@ class DpsMeter extends EventEmitter {
         this.timeline[sec] += amount;
 
         if (this.hitsLog.length < MAX_HITS_LOGGED) {
-            this.hitsLog.push([Math.round(t), powerId, amount, crit ? 1 : 0, kind === 'dot' ? 'dot' : 'hit', name, summon ? summon.name : '']);
+            this.hitsLog.push([Math.round(t), e.powerId, amount, crit ? 1 : 0, kind === 'dot' ? 'dot' : 'hit', name, summon ? summon.name : '', row.key]);
         }
 
-        // The cast this hit or tick belongs to: the latest cast of the same power. A recast
-        // refreshes a DoT, so later ticks go to the newer cast.
-        let entry = summon ? null : this.lastCast.get(powerId);
-        if (!entry && !summon && this.powers) {
-            // A follow-up or rune power that was never cast itself (a Bleed a legendary rune adds):
-            // its damage goes to the latest cast of its skill.
-            const p = this.powers.get(powerId);
-            if (p && p.followUp) entry = this.lastByKey.get(row.key) || null;
-        }
+        // The cast this hit or tick belongs to: the latest cast of the power that hit (for a proc,
+        // the power that set it off; for a summon, the power that summoned it). A recast
+        // refreshes a DoT, so later ticks go to the newer cast. Damage from a skill's power that
+        // was never cast itself (Frost Armor Ice, a Bleed a legendary rune adds) goes to the
+        // latest thing that skill did: its cast, or a run of the basic attacks it enchants.
+        let entry = this.lastCast.get(where.entryPowerId) || null;
+        if (!entry && row.ability) entry = this.latestFor(row.ability);
         if (entry && t - entry.t <= CAST_WINDOW_MS) {
             entry.damage += amount;
             if (kind === 'dot') {
@@ -281,6 +342,14 @@ class DpsMeter extends EventEmitter {
         this.emit('change');
     }
 
+    /** The latest rotation entry of a skill: its cast, or a run of the basic attacks it enchants. */
+    latestFor(ability) {
+        const cast = this.lastByKey.get(ability) || null;
+        const run = this.lastOverride.get(ability) || null;
+        if (!cast || !run) return cast || run;
+        return run.endT > cast.endT ? run : cast;
+    }
+
     /**
      * What a cast was: a hotbar 'spell', a basic attack ('melee' or 'ranged'), or 'other'.
      * Melee or ranged comes from the power's TargetMethod in the game data (MeleeCombo,
@@ -290,12 +359,15 @@ class DpsMeter extends EventEmitter {
      */
     castKind(powerId, combo, projectile) {
         const p = this.powers ? this.powers.get(powerId) : null;
+        // A skill's own basic attacks (Hailstone Embrace's Frost Armor Melee and Ranged).
+        if (p && p.basicOverride) return /projectile|lobbed/i.test(p.targetMethod) ? 'ranged' : 'melee';
         if (p && p.ability && p.ability[2] > 0) return 'spell';
         if (!combo && !isBasicPower(p)) return 'other';
         const how = p ? p.targetMethod : '';
-        if (/projectile|ranged|lobbed/i.test(how)) return 'ranged';
+        if (/projectile|lobbed/i.test(how)) return 'ranged';
         if (/melee|cleave|punch/i.test(how)) return 'melee';
         if (combo) return combo.isMelee ? 'melee' : 'ranged';
+        if (how) return 'other';
         return /melee/i.test(p.name) || !projectile ? 'melee' : 'ranged';
     }
 
@@ -313,23 +385,30 @@ class DpsMeter extends EventEmitter {
             this.ignored.casts += 1;
             return;
         }
-        const row = this.rowFor(powerId, '');
         const p = this.powers ? this.powers.get(powerId) : null;
+        // The mount (Summon Mount, Dismount) and the procs the client fires by itself (Devour's
+        // ProcDevour heal) are not part of the fight: no row, no cast, no place in the rotation.
+        if (p && (p.mount || p.proc)) {
+            return;
+        }
         const kind = this.castKind(powerId, combo, projectile);
         const t = Math.round(this.elapsedMs());
-        // A skill's follow-up (Mist Walk's closing strike, Charon's Blades' avatar attacks) is
-        // part of the cast that started it, not another press of the key.
-        if (p && p.followUp) {
-            const parent = this.lastByKey.get(row.key);
+        // A skill's follow-up (Mist Walk's closing strike, Charon's Blades' opening attack and its
+        // end, Black Miasma's Shadow Tendril cloud) is part of the cast that started it, not
+        // another press of the key, even when that cast came before the timer started.
+        if (p && p.followUp && !p.basicOverride) {
+            const parent = this.lastByKey.get(p.abilityKey);
             if (parent && t - parent.endT <= CAST_WINDOW_MS) {
                 parent.endT = t;
                 parent.powerIds.add(powerId);
                 this.lastCast.set(powerId, parent);
                 this.emit('change');
-                return;
             }
+            return;
         }
-        row.casts += 1;
+        const row = this.rowFor(powerId);
+        // A skill's version of the basic attacks is a basic attack, not another cast of the skill.
+        if (!(p && p.basicOverride)) row.casts += 1;
         this.totals.casts += 1;
         const last = this.rotation[this.rotation.length - 1];
         if ((kind === 'melee' || kind === 'ranged') && last && last.kind === kind) {
@@ -337,6 +416,7 @@ class DpsMeter extends EventEmitter {
             last.endT = t;
             last.powerIds.add(powerId);
             this.lastCast.set(powerId, last);
+            if (p && p.basicOverride) this.lastOverride.set(p.abilityKey, last);
             this.emit('change');
             return;
         }
@@ -350,7 +430,7 @@ class DpsMeter extends EventEmitter {
             key: row.key,
             group: p ? p.abilityKey || p.group || '' : '',
             slot: kind === 'spell' && p && p.ability ? p.ability[2] : 0,
-            label: row.label,
+            label: p && p.basicOverride ? row.label + (kind === 'ranged' ? ' ranged attacks' : ' melee attacks') : row.label,
             rank: p && p.rank ? p.rank : 0,
             casts: 1,
             hits: 0,
@@ -363,7 +443,8 @@ class DpsMeter extends EventEmitter {
         this.rotation.push(entry);
         if (this.rotation.length > MAX_ROTATION) this.rotation.shift();
         this.lastCast.set(powerId, entry);
-        this.lastByKey.set(row.key, entry);
+        if (p && p.basicOverride) this.lastOverride.set(p.abilityKey, entry);
+        else this.lastByKey.set(row.key, entry);
         this.emit('change');
     }
 
@@ -429,8 +510,11 @@ class DpsMeter extends EventEmitter {
 
     rowView(row, total, seconds) {
         const scan = this.scanAbilities[row.key] || null;
-        const p = this.powers ? this.powers.get(row.lastPowerId) : null;
+        const P = this.powers;
         const ranks = Array.from(row.ranks).sort((a, b) => a - b);
+        // A skill's row describes the skill (Charon's Blades), not whichever of its powers hit last.
+        const p = P ? (row.ability ? P.mainPower(row.ability, ranks[ranks.length - 1]) : null) || P.get(row.lastPowerId) : null;
+        const slot = P && row.ability ? P.slotOf(row.ability) : p && p.ability && p.ability[2] > 0 ? p.ability[2] : 0;
         return {
             key: row.key,
             label: row.label,
@@ -454,8 +538,8 @@ class DpsMeter extends EventEmitter {
             description: scan && scan.description ? scan.description : p ? p.description : '',
             damageType: p ? p.damageType : '',
             powerIds: Array.from(row.powerIds),
-            powerKey: p ? p.abilityKey || p.group || String(p.name || '').replace(/\d+$/, '') : '',
-            slot: p && p.ability && p.ability[2] > 0 ? p.ability[2] : 0,
+            powerKey: row.ability || (p ? p.abilityKey || p.group || String(p.name || '').replace(/\d+$/, '') : ''),
+            slot,
             summon: row.summon,
             monster: row.monster,
             hotkey: '',
@@ -479,7 +563,7 @@ class DpsMeter extends EventEmitter {
             if (!v) {
                 v = this.rowView(
                     {
-                        key: e.group, label: e.label, ranks: new Set(e.rank ? [e.rank] : []), powerIds: new Set(), lastPowerId: 0,
+                        key: e.group, label: e.label, ability: '', ranks: new Set(e.rank ? [e.rank] : []), powerIds: new Set(), lastPowerId: 0,
                         casts: 0, hits: 0, crits: 0, critDamage: 0, hitDamage: 0, dotDamage: 0, dotTicks: 0, summonDamage: 0,
                         damage: 0, maxHit: 0, byStat: emptyStats(), summon: false, monster: false
                     },
@@ -502,7 +586,10 @@ class DpsMeter extends EventEmitter {
                 equippedRows.push(v);
             }
         }
-        const others = Array.from(views.values()).sort((a, b) => b.damage - a.damage || b.casts - a.casts);
+        // Other damage is damage: a power that did none (a helper, a buff) isn't listed.
+        const others = Array.from(views.values())
+            .filter((r) => r.damage > 0)
+            .sort((a, b) => b.damage - a.damage || b.casts - a.casts);
         const last = this.timeline.length;
         return {
             state: this._state,
@@ -577,4 +664,4 @@ class DpsMeter extends EventEmitter {
     }
 }
 
-module.exports = { DpsMeter, initials, isBasicPower, SLOT_KEYS };
+module.exports = { DpsMeter, initials, isBasicPower, SLOT_KEYS, CHARON };

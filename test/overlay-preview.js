@@ -17,7 +17,7 @@ const { PowerTable } = require('../src/dps/powers');
 const outDir = process.argv[2] || 'overlay-preview';
 const backdrop = process.argv[3] || '';
 const fontsDir = process.argv[4] || path.join(__dirname, '..', 'app', 'fonts');
-fs.mkdirSync(outDir, { recursive: true });
+if (require.main === module) fs.mkdirSync(outDir, { recursive: true });
 
 const table = new PowerTable(JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src', 'dps', 'powers-snapshot.json'), 'utf8')));
 
@@ -156,7 +156,9 @@ const PAGE = (bg) => `<!DOCTYPE html><html><head><style>
   #game-container{width:100vw;height:100vh;background:#484955 ${bg ? `url(data:image/png;base64,${bg}) center/auto 100% no-repeat` : ''}}
   </style></head><body><div id="game-container"><object id="DungeonBlitz" type="application/x-shockwave-flash" width="100%" height="100%"></object></div></body></html>`;
 
-(async () => {
+module.exports = { harness, view, launcherState, PAGE };
+
+if (require.main === module) (async () => {
     const fonts = {};
     if (fontsDir) {
         for (const f of ['averia-serif-libre-400.woff2', 'averia-serif-libre-700.woff2']) {
