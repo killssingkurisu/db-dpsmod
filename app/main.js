@@ -39,12 +39,14 @@ if (smokeFile) app.setPath('userData', path.join(os.tmpdir(), 'db-dps-launcher-s
 /* ---------- log ---------- */
 
 const logFile = path.join(app.getPath('userData'), 'launcher.log');
-try {
-    fs.mkdirSync(path.dirname(logFile), { recursive: true });
-    // One start's worth plus the one before it.
-    if (fs.existsSync(logFile)) fs.renameSync(logFile, logFile.replace(/\.log$/, '.previous.log'));
-} catch (_e) {
-    // logging is best effort
+/** Starts this run's log; the last run's is kept as launcher.previous.log. */
+function openLog() {
+    try {
+        fs.mkdirSync(path.dirname(logFile), { recursive: true });
+        if (fs.existsSync(logFile)) fs.renameSync(logFile, logFile.replace(/\.log$/, '.previous.log'));
+    } catch (_e) {
+        // logging is best effort
+    }
 }
 function log(message) {
     const line = new Date().toISOString() + ' ' + message;
@@ -58,9 +60,11 @@ function log(message) {
 
 /* ---------- one launcher at a time ---------- */
 
+// A second start (the shortcut clicked again) only brings the open launcher to the front.
 if (!smokeFile && !app.requestSingleInstanceLock()) {
     app.quit();
 } else {
+    openLog();
     start();
 }
 
