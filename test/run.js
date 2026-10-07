@@ -708,6 +708,110 @@ async function main() {
             assert.strictEqual(m.snapshot().dungeon, null);
         });
 
+        const id = (name) => {
+            for (const p of live.byId.values()) if (p.name === name) return p.id;
+            throw new Error('no power ' + name);
+        };
+        const melee = (m) => m.recordCast({ powerId: 969, combo: { isMelee: true, id: 1 } });
+        const R = (m) => m.report().rotation.map((e) => [e.badge, e.t, e.times.join('/'), e.damage]);
+
+        await check('the cast whose hit starts or restarts the clock is in the rotation, at that moment', () => {
+            const { m, at, hit } = make();
+            at(0);
+            melee(m); // before the first hit, while the clock waits
+            at(300);
+            hit(); // its hit starts the clock
+            at(800);
+            melee(m);
+            at(1000);
+            hit();
+            at(4100);
+            m.tick(); // paused at 0.7 s
+            at(9000);
+            m.recordCast({ powerId: id('MistWalk10') }); // walking to the next pack, 11 s before its first hit
+            at(19400);
+            m.recordCast({ powerId: id('ShadowBlade10') });
+            at(20000);
+            m.recordDamage({ kind: 'hit', powerId: id('ShadowBlade10'), damage: 5000, targetName: 'Goblin' });
+            at(20200);
+            melee(m);
+            at(20400);
+            hit();
+            at(24000);
+            m.tick(); // paused at 1.1 s
+            at(30000);
+            melee(m);
+            at(30250);
+            hit();
+            assert.deepStrictEqual(R(m), [
+                ['MA2', 0, '0/500', 2000],
+                ['s5', 700, '700', 5000],
+                ['MA1', 900, '900', 1000],
+                ['MA1', 1100, '1100', 1000]
+            ], 'a run of basic attacks ends when the clock stops');
+            const s = m.snapshot();
+            assert.deepStrictEqual([s.totals.casts, s.ignored.casts], [5, 1], 'only the Mist Walk long before is left out');
+            const j = exporter.toJson(m.report(), { source: 'test' });
+            assert.deepStrictEqual(j.rotation.casts.map((c) => c.castTimesMs), [[0, 500], [700], [900], [1100]]);
+            assert.strictEqual(j.rotation.text, 'MA2 s5 MA1 MA1');
+        });
+
+        await check('a cast whose hit took longer than 3 s to land still counts, with everything cast after it', () => {
+            const { m, at, hit } = make();
+            const legion = id('ShadowLegion10');
+            at(0);
+            hit();
+            at(3100);
+            m.tick(); // paused at 0
+            at(10000);
+            m.recordCast({ powerId: id('MistWalk10') }); // before the summon: not part of it
+            at(11000);
+            m.recordCast({ powerId: legion }); // its clones walk to the next pack
+            at(12500);
+            m.recordCast({ powerId: id('DeathBlowOld10') }); // Assassinate, which misses
+            at(16000);
+            m.recordDamage({ kind: 'hit', powerId: id('SwordMelee'), damage: 1500, summon: { name: 'ShadowLegionClone10', powerId: legion }, targetName: 'Goblin' });
+            assert.deepStrictEqual(R(m), [['s5', 0, '0', 1500], ['s3', 0, '0', 0]]);
+            assert.strictEqual(m.snapshot().ignored.casts, 1);
+        });
+
+        await check('casts after your last hit, made while the lull is noticed, are timed when the clock stopped', () => {
+            const { m, at, hit } = make();
+            at(0);
+            hit();
+            at(1000);
+            hit();
+            at(2500);
+            m.recordCast({ powerId: id('DeathBlowOld10') }); // the pack is dead: it hits nothing
+            at(3200);
+            melee(m);
+            at(4000);
+            m.tick();
+            assert.strictEqual(m.snapshot().elapsedMs, 1000);
+            assert.deepStrictEqual(m.rotation.map((e) => [e.kind, e.t, e.endT, e.times.join('/')]), [['spell', 1000, 1000, '1000'], ['melee', 1000, 1000, '1000']]);
+            at(9000);
+            melee(m);
+            at(9200);
+            hit();
+            const times = m.rotation.map((e) => e.t);
+            assert.deepStrictEqual(times, [1000, 1000, 1000], 'never back in time');
+            assert.deepStrictEqual(R(m), [['s3', 1000, '1000', 0], ['MA1', 1000, '1000', 1000]], 'the missed swing before the pause is its own (empty) run');
+        });
+
+        await check('the opener of the next dungeon goes into its new run', () => {
+            const { m, at, hit } = make();
+            at(0);
+            hit(7000);
+            m.levelProgress(100);
+            m.noteLevel('SRN_Mission1');
+            at(59500);
+            melee(m);
+            at(60000);
+            hit(1234);
+            assert.deepStrictEqual(R(m), [['MA1', 0, '0', 1234]]);
+            assert.deepStrictEqual([m.snapshot().totals.casts, m.snapshot().ignored.casts], [1, 0]);
+        });
+
         await check('the relay reports your death and revive, a boss dying, completion and Level Complete', () => {
             const t = new CombatTracker('test');
             const seen = [];
@@ -857,14 +961,35 @@ async function main() {
         assert.deepStrictEqual(j.rotation.casts.map((c) => c.label), ['MA3', 's1', 'RA2', 's5', 's1']);
         assert.strictEqual(j.rotation.text, 'MA3 s1 RA2 s5 s1');
         assert.deepStrictEqual([j.rotation.casts[0].casts, j.rotation.casts[0].hits, j.rotation.casts[3].slotKey], [2, 3, 'E']);
+        assert.deepStrictEqual(j.rotation.casts.map((c) => c.castTimesMs), [[0, 400], [900], [2000, 2000], [2600], [2600]], 'every basic attack has its own time');
         const csv = exporter.toCsv(m.report(), { character: 'ksq' });
-        assert.ok(csv.includes('\r\nRotation,Time (s),Shown as,Spell,Kind,Casts,Damage'), csv);
-        assert.ok(csv.includes('\r\n2,0.9,s1,Poison Strike,spell,1,6600,6100,500,2,0\r\n'), csv);
+        assert.ok(csv.includes('\r\nRotation,Time (s),Shown as,Spell,Kind,Casts,Damage,Direct damage,DoT damage,Hits,Crits,Cast times (s)\r\n'), csv);
+        assert.ok(csv.includes('\r\n1,0,MA3,Sword Melee,melee,2,300,300,0,3,1,0 0.4\r\n'), csv);
+        assert.ok(csv.includes('\r\n2,0.9,s1,Poison Strike,spell,1,6600,6100,500,2,0,0.9\r\n'), csv);
         assert.ok(exporter.toSummary(m.report(), {}).includes('Rotation: MA3 s1 RA2 s5 s1'));
         const g = m.snapshot().dpsSeries;
         assert.deepStrictEqual([g.bucketSec, g.seconds, g.perSecond.length], [1, 2, 2], 'the second in progress is left out');
         m.reset();
         assert.strictEqual(m.snapshot().rotation.count, 0);
+    });
+
+    await check('Start on first hit counts the cast that landed it; Start by hand counts from the click', () => {
+        let now = 0;
+        const m = new DpsMeter({ powers: table, now: () => now });
+        m.autoStart = true;
+        m.recordCast({ powerId: 993 });
+        now = 400;
+        m.recordDamage({ kind: 'hit', powerId: 993, damage: 3000 });
+        const r = m.snapshot().rotation;
+        assert.deepStrictEqual(r.entries.map((e) => [e.badge, e.t, e.damage]), [['s1', 0, 3000]]);
+        assert.deepStrictEqual([m.snapshot().totals.casts, m.snapshot().ignored.casts], [1, 0]);
+        const h = new DpsMeter({ powers: table, now: () => now });
+        h.recordCast({ powerId: 993 });
+        now = 800;
+        h.start();
+        h.recordDamage({ kind: 'hit', powerId: 993, damage: 3000 });
+        assert.strictEqual(h.snapshot().rotation.count, 0, 'a cast before Start is not part of it');
+        assert.deepStrictEqual([h.snapshot().totals.casts, h.snapshot().ignored.casts], [0, 1]);
     });
 
     console.log('Spell scans');

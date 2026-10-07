@@ -26,6 +26,14 @@ const CHARON = 'SeekingBlades';
 const ORIGIN_PROCS = new Set(['ProcGlancingBlow']);
 /** Dungeon mode: no damage from you for this long pauses the clock (at your last hit). */
 const DUNGEON_IDLE_MS = 3000;
+/**
+ * Casts made while the clock is stopped, in this long before the hit that starts or restarts it,
+ * are part of the fight (see takeLeadIn).
+ */
+const LEAD_IN_MS = 3000;
+/** How far back the cast whose hit (re)starts the clock is looked for, when it took longer to land. */
+const CAUSE_MS = 10000;
+const MAX_HELD = 40;
 /** A dungeon completing this soon after a boss died was that boss's doing. */
 const BOSS_RECENT_MS = 15000;
 
@@ -110,8 +118,10 @@ class DpsMeter extends EventEmitter {
         return this.accumMs + (this._state === 'running' ? Math.max(0, this.now() - this.segmentStart) : 0);
     }
 
-    /** Starts the clock (the Start button, F6, Start on first hit). In Dungeon mode it also carries on a run. */
+    /** Starts the clock (the Start button, F6). In Dungeon mode it also carries on a run. */
     start() {
+        // You chose when it starts: casts made before that aren't part of it.
+        this.held = [];
         this.begin();
         if (this.dungeonMode) {
             this.setPhase('running', '');
@@ -157,6 +167,27 @@ class DpsMeter extends EventEmitter {
         this.accumMs += end - this.segmentStart;
         this._state = 'stopped';
         this.stoppedAt = new Date(end).toISOString();
+        this.clampRotation(Math.round(this.accumMs));
+        // Basic attacks after the clock starts again are a new run, not more of this one.
+        const last = this.rotation[this.rotation.length - 1];
+        if (last) last.closed = true;
+    }
+
+    /**
+     * The clock just stopped as of an earlier moment (your last hit, when a lull, a death or a
+     * boss stopped it): casts made since, while the lull was being noticed, were timed past it.
+     * They stay in the rotation, at the moment the clock stopped, so its times only go forward.
+     */
+    clampRotation(limit) {
+        for (let i = this.rotation.length - 1; i >= 0; i--) {
+            const e = this.rotation[i];
+            if (e.endT <= limit) continue;
+            e.t = Math.min(e.t, limit);
+            e.endT = limit;
+            for (let k = 0; k < e.times.length; k++) {
+                if (e.times[k] > limit) e.times[k] = limit;
+            }
+        }
     }
 
     toggle() {
@@ -180,6 +211,8 @@ class DpsMeter extends EventEmitter {
         this.levels = [];
         this.rotation = []; // every cast, in order: see recordCast
         this.rotationSeq = 0;
+        this.held = []; // casts made while the clock was stopped, for a moment: see takeLeadIn
+        this.runId = (this.runId || 0) + 1;
         this.lastCast = new Map(); // powerId -> its latest rotation entry
         this.lastByKey = new Map(); // spell row key -> its latest cast
         this.lastOverride = new Map(); // skill -> its latest run of enchanted basic attacks
@@ -246,6 +279,7 @@ class DpsMeter extends EventEmitter {
     playerDied() {
         if (this.playerDead) return;
         this.playerDead = true;
+        this.held = []; // what you cast before dying didn't lead to your next hit
         const d = this.dungeon;
         if (this._state !== 'idle' && d.phase !== 'ended') d.deaths += 1;
         if (this.dungeonMode && this._state === 'running') {
@@ -270,12 +304,12 @@ class DpsMeter extends EventEmitter {
         d.lastBoss = name || 'A boss';
         d.lastBossAt = this.now();
         if (this._state === 'idle' || d.phase === 'ended') return;
-        d.bosses.push({ name: d.lastBoss, atMs: Math.round(this.elapsedMs()) });
         if (this.dungeonMode && this._state === 'running') {
             // The killing blow was your last hit, or near enough.
             this.pauseClock(d.lastHitAt);
             this.setPhase('paused', 'boss');
         }
+        d.bosses.push({ name: d.lastBoss, atMs: Math.round(this.elapsedMs()) });
         this.emit('change');
     }
 
@@ -311,6 +345,7 @@ class DpsMeter extends EventEmitter {
         if (this.place.level !== level) {
             this.place = { level, completion: null, complete: false };
             this.playerDead = false;
+            this.held = []; // casts in the last level aren't part of a fight in this one
             const d = this.dungeon;
             if (this.dungeonMode && this._state !== 'idle') {
                 if (d.level && d.level !== level) this.endRun('left');
@@ -464,20 +499,24 @@ class DpsMeter extends EventEmitter {
         }
         // A hit from your own body means you're alive, whatever we missed.
         if (kind === 'hit' && !summon && this.playerDead) this.playerRevived();
+        let started = false;
         if (this.dungeonMode) {
             if (this.dungeon.fresh) {
-                // The first hit in the next dungeon: a new run.
+                // The first hit in the next dungeon: a new run, with the casts that led to it.
                 const autoStart = this.autoStart;
+                const held = this.held;
                 this.reset();
                 this.autoStart = autoStart;
+                this.held = held;
             }
             const d = this.dungeon;
             if (this._state !== 'running' && d.phase !== 'ended' && !this.playerDead) {
-                this.begin();
+                started = this.begin();
                 this.setPhase('running', '');
             }
-        } else if (this._state !== 'running' && this.autoStart && this._state === 'idle') {
-            this.start();
+        } else if (this._state === 'idle' && this.autoStart) {
+            // Start on first hit.
+            started = this.begin();
         }
         if (this._state !== 'running') {
             this.ignored.hits += 1;
@@ -485,9 +524,10 @@ class DpsMeter extends EventEmitter {
             this.emit('ignored');
             return;
         }
+        const where = this.resolve(e);
+        if (started) this.takeLeadIn(where);
         const t = this.elapsedMs();
         this.dungeon.lastHitAt = this.now();
-        const where = this.resolve(e);
         const row = this.rowFor(where.rowPowerId, { ability: where.ability, summonName: where.summonName });
         const stat = this.powers ? this.powers.statFor(where.rowPowerId, kind) : 'unknown';
         const s = STATS.includes(stat) ? stat : 'unknown';
@@ -589,28 +629,76 @@ class DpsMeter extends EventEmitter {
      * projectile: whether it fired a projectile.
      *
      * Every spell cast is its own rotation entry. Basic attacks in a row are one entry, a run,
-     * until something else is cast: they are the most frequent casts by far, and the run's
-     * count (MA3, RA5) goes up with each hit it lands.
+     * until something else is cast or the clock stops: they are the most frequent casts by far,
+     * and the run's count (MA3, RA5) goes up with each hit it lands. Every cast in it keeps its
+     * own time (times).
      */
-    recordCast({ powerId, combo, projectile }) {
+    recordCast(cast) {
         // Casting means you're alive, whatever we missed.
         if (this.playerDead) this.playerRevived();
-        // A cast alone never starts the clock (auto-start waits for the first hit).
-        if (this._state !== 'running') {
-            this.ignored.casts += 1;
-            return;
-        }
-        const p = this.powers ? this.powers.get(powerId) : null;
+        const p = this.powers ? this.powers.get(cast.powerId) : null;
         // The mount (Summon Mount, Dismount) and the procs the client fires by itself (Devour's
         // ProcDevour heal) are not part of the fight: no row, no cast, no place in the rotation.
         if (p && (p.mount || p.proc)) {
             return;
         }
+        if (this._state !== 'running') {
+            // A cast alone never starts the clock (auto-start waits for the first hit), but the
+            // hit that starts it can be this cast's: see takeLeadIn.
+            this.holdCast(cast, p);
+            return;
+        }
+        this.addCast(cast, p);
+    }
+
+    /** A cast made while the clock is stopped, kept for a few seconds. */
+    holdCast({ powerId, combo, projectile }, p) {
+        const now = this.now();
+        // A skill's follow-up is part of the cast that started it, not a cast of its own.
+        const counted = !(p && p.followUp && !p.basicOverride);
+        if (counted) this.ignored.casts += 1;
+        this.held = this.held.filter((h) => now - h.at <= CAUSE_MS);
+        this.held.push({ powerId, combo, projectile, ability: (p && p.abilityKey) || '', at: now, run: this.runId, counted });
+        if (this.held.length > MAX_HELD) this.held.shift();
+    }
+
+    /**
+     * A hit just started or restarted the clock. The casts that led to it were made while it was
+     * stopped, a moment before (a cast reaches the meter before its hit does): the cast whose hit
+     * this is (the latest cast of the power that hit, or of its skill), everything cast after it,
+     * and anything cast in the 3 seconds before the hit. They are part of the fight, so they go
+     * into the rotation, in order, at the moment the clock started; the hit counts for its cast.
+     */
+    takeLeadIn(where) {
+        const now = this.now();
+        const held = this.held.filter((h) => now - h.at <= CAUSE_MS);
+        this.held = [];
+        if (!held.length) return;
+        const P = this.powers;
+        const hp = P ? P.get(where.rowPowerId) : null;
+        const ability = where.ability || (hp && hp.abilityKey && hp.ability && hp.ability[2] > 0 ? hp.abilityKey : '');
+        let from = held.findIndex((h) => now - h.at <= LEAD_IN_MS);
+        if (from < 0) from = held.length;
+        for (let i = held.length - 1; i >= 0; i--) {
+            const h = held[i];
+            if (h.powerId === where.entryPowerId || (ability && h.ability === ability)) {
+                from = Math.min(from, i);
+                break;
+            }
+        }
+        for (const h of held.slice(from)) {
+            if (h.counted && h.run === this.runId && this.ignored.casts > 0) this.ignored.casts -= 1;
+            this.addCast(h, P ? P.get(h.powerId) : null);
+        }
+    }
+
+    /** A cast while the clock runs, into the rotation. */
+    addCast({ powerId, combo, projectile }, p) {
         const kind = this.castKind(powerId, combo, projectile);
         const t = Math.round(this.elapsedMs());
         // A skill's follow-up (Mist Walk's closing strike, Charon's Blades' opening attack and its
         // end, Black Miasma's Shadow Tendril cloud) is part of the cast that started it, not
-        // another press of the key, even when that cast came before the timer started.
+        // another press of the key.
         if (p && p.followUp && !p.basicOverride) {
             const parent = this.lastByKey.get(p.abilityKey);
             if (parent && t - parent.endT <= CAST_WINDOW_MS) {
@@ -626,9 +714,10 @@ class DpsMeter extends EventEmitter {
         if (!(p && p.basicOverride)) row.casts += 1;
         this.totals.casts += 1;
         const last = this.rotation[this.rotation.length - 1];
-        if ((kind === 'melee' || kind === 'ranged') && last && last.kind === kind) {
+        if ((kind === 'melee' || kind === 'ranged') && last && last.kind === kind && !last.closed) {
             last.casts += 1;
             last.endT = t;
+            last.times.push(t);
             last.powerIds.add(powerId);
             this.lastCast.set(powerId, last);
             if (p && p.basicOverride) this.lastOverride.set(p.abilityKey, last);
@@ -648,6 +737,8 @@ class DpsMeter extends EventEmitter {
             label: p && p.basicOverride ? row.label + (kind === 'ranged' ? ' ranged attacks' : ' melee attacks') : row.label,
             rank: p && p.rank ? p.rank : 0,
             casts: 1,
+            times: [t], // when each of its casts was made
+            closed: false, // a run of basic attacks ends when the clock stops
             hits: 0,
             crits: 0,
             hitDamage: 0,
@@ -683,35 +774,40 @@ class DpsMeter extends EventEmitter {
         return this.rotation.filter((e) => (e.kind === 'spell' ? true : e.kind === 'other' ? e.damage > 0 : e.hits > 0 || e.damage > 0));
     }
 
-    rotationView(limit) {
+    /** The Rotation window's entries (the latest `limit`, all with 0); `withTimes` adds each cast's time. */
+    rotationView(limit, withTimes) {
         const list = this.rotationEntries();
         const shown = limit ? list.slice(-limit) : list;
         return {
             count: list.length,
             casts: list.reduce((n, e) => n + e.casts, 0),
             text: list.filter((e) => e.kind !== 'other').map((e) => this.badge(e)).join(' '),
-            entries: shown.map((e) => ({
-                id: e.id,
-                t: e.t,
-                endT: e.endT,
-                badge: this.badge(e),
-                kind: e.kind,
-                key: e.key,
-                group: e.group,
-                label: e.label,
-                rank: e.rank,
-                slot: e.slot,
-                slotKey: SLOT_KEYS[e.slot] || '',
-                powerId: e.powerId,
-                powerIds: Array.from(e.powerIds),
-                casts: e.casts,
-                damage: e.damage,
-                hitDamage: e.hitDamage,
-                dotDamage: e.dotDamage,
-                dotTicks: e.dotTicks,
-                hits: e.hits,
-                crits: e.crits
-            }))
+            entries: shown.map((e) => {
+                const v = {
+                    id: e.id,
+                    t: e.t,
+                    endT: e.endT,
+                    badge: this.badge(e),
+                    kind: e.kind,
+                    key: e.key,
+                    group: e.group,
+                    label: e.label,
+                    rank: e.rank,
+                    slot: e.slot,
+                    slotKey: SLOT_KEYS[e.slot] || '',
+                    powerId: e.powerId,
+                    powerIds: Array.from(e.powerIds),
+                    casts: e.casts,
+                    damage: e.damage,
+                    hitDamage: e.hitDamage,
+                    dotDamage: e.dotDamage,
+                    dotTicks: e.dotTicks,
+                    hits: e.hits,
+                    crits: e.crits
+                };
+                if (withTimes) v.times = e.times.slice();
+                return v;
+            })
         };
     }
 
@@ -868,10 +964,10 @@ class DpsMeter extends EventEmitter {
             targets: Array.from(this.targets.values()).sort((a, b) => b.damage - a.damage),
             timeline: this.timeline.slice(),
             hits: this.hitsLog.slice(),
-            rotation: this.rotationView(0).entries,
+            rotation: this.rotationView(0, true).entries,
             stoppedAt: this.stoppedAt
         };
     }
 }
 
-module.exports = { DpsMeter, initials, isBasicPower, SLOT_KEYS, CHARON, DUNGEON_IDLE_MS };
+module.exports = { DpsMeter, initials, isBasicPower, SLOT_KEYS, CHARON, DUNGEON_IDLE_MS, LEAD_IN_MS };
