@@ -1,0 +1,767 @@
+'use strict';
+
+/**
+ * Checks for the DPS meter that run under plain Node (12+): packet decoding, the relay end to
+ * end over real sockets, the meter's arithmetic, the export formats and the power table.
+ * test/launcher.js checks the launcher around it.
+ *
+ *   node test/run.js
+ *
+ * DBDPS_LIVE_SWF=<DungeonBlitz.swf> also patches a real client and checks what changed.
+ */
+
+const assert = require('assert');
+const fs = require('fs');
+const net = require('net');
+const os = require('os');
+const path = require('path');
+
+const P = require('../src/dps/protocol');
+const http = require('http');
+const { GameRelay, RelayHub, CombatTracker, POLICY } = require('../src/dps/relay');
+const { WebProxy } = require('../src/dps/httpProxy');
+const swfpatch = require('../src/dps/swfpatch');
+const { DpsMeter } = require('../src/dps/meter');
+const { PowerTable, parseScaling } = require('../src/dps/powers');
+const exporter = require('../src/dps/exporter');
+const { readScan } = require('../src/dps/spellScans');
+
+let passed = 0;
+const failures = [];
+async function check(name, fn) {
+    try {
+        await fn();
+        passed += 1;
+        console.log('  ok   ' + name);
+    } catch (err) {
+        failures.push(name);
+        console.log('  FAIL ' + name + '\n       ' + ((err && err.stack) || err).split('\n').slice(0, 4).join('\n       '));
+    }
+}
+
+/* ---------- a writer that encodes like the client's Packet class ---------- */
+
+class BitWriter {
+    constructor() {
+        this.bits = [];
+    }
+    raw(value, n) {
+        for (let i = n - 1; i >= 0; i--) this.bits.push(Math.floor(value / Math.pow(2, i)) % 2);
+        return this;
+    }
+    bool(b) {
+        return this.raw(b ? 1 : 0, 1);
+    }
+    uint(v) {
+        const need = v > 0 ? Math.floor(Math.log2(v)) + 1 : 1;
+        const use = Math.max(2, (need + 1) & ~1);
+        this.raw(use / 2 - 1, 4);
+        return this.raw(v, use);
+    }
+    sint(v) {
+        this.bool(v < 0);
+        return this.uint(Math.abs(v));
+    }
+    sint3(v) {
+        this.bool(v < 0);
+        const a = Math.abs(v);
+        const need = a > 0 ? Math.floor(Math.log2(a)) + 1 : 1;
+        const use = Math.max(2, (need + 1) & ~1);
+        this.raw(use / 2 - 1, 3);
+        return this.raw(a, use);
+    }
+    str(s) {
+        const b = Buffer.from(s, 'utf8');
+        this.raw(b.length, 16);
+        for (const x of b) this.raw(x, 8);
+        return this;
+    }
+    buffer() {
+        const bits = this.bits.slice();
+        while (bits.length % 8) bits.push(0);
+        const out = Buffer.alloc(bits.length / 8);
+        for (let i = 0; i < bits.length; i++) if (bits[i]) out[i >> 3] |= 0x80 >> (i & 7);
+        return out;
+    }
+}
+
+function frame(id, payload) {
+    const h = Buffer.alloc(4);
+    h.writeUInt16BE(id, 0);
+    h.writeUInt16BE(payload.length, 2);
+    return Buffer.concat([h, payload]);
+}
+
+const pkt = {
+    fullUpdate: (id, name, { isPlayer = false, team = 1, summoner = 0, power = 0 } = {}) => {
+        const w = new BitWriter().uint(id).sint(1200).sint(-40).sint(0).str(name).raw(team, 2).bool(isPlayer).sint3(0).bool(false);
+        w.bool(Boolean(summoner));
+        if (summoner) w.uint(summoner);
+        w.bool(Boolean(power));
+        if (power) w.uint(power);
+        return frame(0x08, w.raw(0, 2).bool(true).bool(false).bool(false).bool(false).bool(false).buffer());
+    },
+    cast: (source, power) => frame(0x09, new BitWriter().uint(source).uint(power).bool(true).bool(false).bool(false).bool(false).bool(false).bool(false).buffer()),
+    hit: (target, source, damage, power, crit) =>
+        frame(0x0a, new BitWriter().uint(target).uint(source).sint(damage).uint(power).bool(false).bool(false).bool(crit).buffer()),
+    dot: (target, source, power, amount) => frame(0x79, new BitWriter().uint(target).uint(source).uint(power).sint(amount).raw(0, 5).buffer()),
+    spawn: (id, name, isPlayer, team) => {
+        const w = new BitWriter().uint(id).str(name).raw(isPlayer ? 1 : 0, 1);
+        if (isPlayer) w.str('Rogue');
+        else w.sint(500).sint(20).sint(0).raw(team, 2);
+        return frame(0x0f, w.buffer());
+    },
+    enterWorld: (host, port, level) =>
+        frame(0x21, new BitWriter().uint(4321).uint(0).str('').bool(false).str(host).uint(port).str('LevelsHome.swf/a_Level_Home').raw(50, 6).raw(50, 6)
+            .str(level).str('').str('').bool(false).bool(false).bool(false).buffer())
+};
+
+/* ---------- a small power table ---------- */
+
+const POWER_DATA = {
+    powers: [
+        [993, 'PoisonStrike10', 'PoisonStrike', 'Poison Strike', 'Physical', '20', 0, 'Deal two venomous strikes [Stats: 1.49x attack, 2x Expertise/s (5s), -10% Speed (5s)]', 0],
+        [984, 'PoisonStrike1', 'PoisonStrike', 'Poison Strike', 'Physical', '20', 0, 'x [Stats: 1x attack, 2x attack/s (5s) | Next rank: 1.1x attack, 2x attack/s (5s)]', 0],
+        [500, 'FireBolt5', 'FireBolt', 'Fire Bolt', 'Fire', '25', 0, 'Hurl fire', 0],
+        [3, 'SwordMelee', '', 'Sword Melee', 'Physical', '0,5', 0, '', 0],
+        [4000, 'SkeletonSlash', '', '', 'Physical', '0', 0, '', 1],
+        [1094, 'PoisonDagger', '', 'Bone Daggers', 'Nature', '0,5', 0, 'Ranged basic attacks leave Poison [Stats: 0.8x attack, 0.5x Expertise/s (5s)]', 0, 'ProjectilePlayer'],
+        [969, 'RapierMelee', '', 'Dagger Melee', 'Physical', '0,5', 0, '', 0, 'MeleeCombo'],
+        [1184, 'MistWalk10', 'MistWalk', 'Mist Walk', 'Physical', '30', 0, 'Dash to enemies', 0, 'Charge', 'MistWalk'],
+        [1185, 'MistWalkClose10', 'MistWalkClose', '', 'Physical', '0', 0, 'Mistwalk combo. [Stats: 0.2x Expertise/s (5s)]', 0, 'PBAoE', 'MistWalk'],
+        [8032, 'LegendaryMistWalk', '', 'Mist Walk', '', '0,5', 0, '', 0, 'MeleeCombo', 'SwordMelee']
+    ],
+    abilities: { PoisonStrike: ['Rogue', 'Assault', 1, 10], FireBolt: ['Mage', 'Fire', 5, 10], PoisonDagger: ['Executioner', 'Assault', 0, 1], MistWalk: ['Executioner', 'Assault', 4, 10] }
+};
+
+async function main() {
+    console.log('Protocol');
+
+    await check('uint/sint round trip, 0 to 2^30', () => {
+        for (const v of [0, 1, 2, 3, 4, 255, 256, 65535, 123456, 2 ** 30 - 1]) {
+            const r = new P.BitReader(new BitWriter().uint(v).sint(-v).sint(v).buffer());
+            assert.strictEqual(r.uint(), v);
+            assert.strictEqual(r.sint(), -v || 0);
+            assert.strictEqual(r.sint(), v);
+        }
+    });
+
+    const serverBitBuffer = process.env.DBDPS_SERVER_BITBUFFER;
+    if (serverBitBuffer && fs.existsSync(serverBitBuffer)) {
+        await check("hit and DoT payloads match the server's own encoder byte for byte", () => {
+            const { BitBuffer } = require(serverBitBuffer);
+            const bb = new BitBuffer(false);
+            bb.writeMethod4(77); bb.writeMethod4(12); bb.writeMethod24(98765); bb.writeMethod4(993);
+            bb.writeMethod15(false); bb.writeMethod15(false); bb.writeMethod15(true);
+            assert.ok(bb.toBuffer().equals(pkt.hit(77, 12, 98765, 993, true).subarray(4)));
+            const d = new BitBuffer(false);
+            d.writeMethod4(77); d.writeMethod4(12); d.writeMethod4(993); d.writeMethod45(-4321); d.writeMethod20 ? d.writeMethod20(5, 0) : d.writeMethod11(0, 5);
+            assert.ok(d.toBuffer().equals(pkt.dot(77, 12, 993, -4321).subarray(4)));
+        });
+    }
+
+    await check('0x0A hit decodes target, source, damage, power, crit', () => {
+        const h = P.parsePowerHit(pkt.hit(301, 12, 48211, 993, true).subarray(4));
+        assert.deepStrictEqual(h, { targetId: 301, sourceId: 12, damage: 48211, powerId: 993, animOverrideId: 0, effectOverrideId: 0, isCrit: true });
+    });
+
+    await check('0x08 own body and summon', () => {
+        const a = P.parseEntityFullUpdate(pkt.fullUpdate(12, 'ksq', { isPlayer: true }).subarray(4));
+        assert.strictEqual(a.isPlayer, true);
+        assert.strictEqual(a.name, 'ksq');
+        const b = P.parseEntityFullUpdate(pkt.fullUpdate(40, 'NecroSkeleton', { team: 1, summoner: 12, power: 4000 }).subarray(4));
+        assert.strictEqual(b.summonerId, 12);
+        assert.strictEqual(b.powerId, 4000);
+    });
+
+    await check('0x0F, 0x21 and 0x79', () => {
+        const e = P.parseNewlyRelevantEntity(pkt.spawn(301, 'GoblinBrute', false, 2).subarray(4));
+        assert.deepStrictEqual([e.id, e.name, e.isPlayer, e.team], [301, 'GoblinBrute', false, 2]);
+        const w = P.parseEnterWorld(pkt.enterWorld('dungeonblitzr.theminesa.studio', 8080, 'CraftTown').subarray(4));
+        assert.deepStrictEqual([w.host, w.port, w.level, w.mapLevel], ['dungeonblitzr.theminesa.studio', 8080, 'CraftTown', 50]);
+        const d = P.parseBuffTickDot(pkt.dot(301, 12, 993, 1500).subarray(4));
+        assert.deepStrictEqual([d.targetId, d.sourceId, d.powerId, d.amount], [301, 12, 993, 1500]);
+    });
+
+    await check('0x21 rewrite: new host and port, every other field kept', () => {
+        for (const [host, port] of [['127.0.0.1', 13690], ['a-much-longer-host-name.example.org', 3], ['h', 65535]]) {
+            const orig = pkt.enterWorld('dungeonblitzr.theminesa.studio', 8080, 'GoblinRiver').subarray(4);
+            const r = P.rewriteEnterWorld(orig, host, port);
+            assert.deepStrictEqual([r.host, r.port], ['dungeonblitzr.theminesa.studio', 8080]);
+            const a = P.parseEnterWorld(orig);
+            const b = P.parseEnterWorld(r.payload);
+            assert.deepStrictEqual([b.host, b.port], [host, port]);
+            assert.deepStrictEqual([b.swf, b.mapLevel, b.baseLevel, b.level, b.alter, b.isDungeon], [a.swf, a.mapLevel, a.baseLevel, a.level, a.alter, a.isDungeon]);
+            const back = P.rewriteEnterWorld(r.payload, a.host, a.port).payload;
+            assert.ok(back.subarray(0, orig.length).equals(orig), 'rewriting back gives the original bits');
+            assert.ok(back.subarray(orig.length).every((x) => x === 0), 'plus zero padding at most');
+        }
+        const w = new P.BitWriter();
+        for (const v of [0, 1, 3, 4, 255, 8080, 2 ** 30 - 1]) w.uint(v);
+        const r = new P.BitReader(w.toBuffer());
+        for (const v of [0, 1, 3, 4, 255, 8080, 2 ** 30 - 1]) assert.strictEqual(r.uint(), v);
+        const t = new BitWriter();
+        for (const v of [0, 1, 3, 4, 255, 8080]) t.uint(v);
+        const w2 = new P.BitWriter();
+        for (const v of [0, 1, 3, 4, 255, 8080]) w2.uint(v);
+        assert.ok(w2.toBuffer().equals(t.buffer()), "the writer picks the client's widths");
+    });
+
+    await check('splitter: any chunking, policy exchange skipped, bad packet ignored', () => {
+        const stream = Buffer.concat([
+            Buffer.from('<policy-file-request/>\0'),
+            pkt.hit(1, 2, 3, 4, false),
+            frame(0x0a, Buffer.from([0xff])), // truncated payload: unreadable, must not stop the rest
+            pkt.cast(2, 993),
+            pkt.dot(5, 2, 993, 77)
+        ]);
+        for (let size = 1; size <= stream.length; size += 3) {
+            const got = [];
+            const s = new P.PacketSplitter((id) => got.push(id));
+            for (let i = 0; i < stream.length; i += size) s.push(stream.subarray(i, i + size));
+            assert.deepStrictEqual(got, [0x0a, 0x0a, 0x09, 0x79]);
+        }
+    });
+
+    console.log('Powers');
+    const table = new PowerTable(POWER_DATA);
+    await check('names, ranks and scaling from the Stats line', () => {
+        const p = table.get(993);
+        assert.deepStrictEqual([p.group, p.rank, p.label], ['PoisonStrike', 10, 'Poison Strike']);
+        assert.strictEqual(table.statFor(993, 'hit'), 'attack');
+        assert.strictEqual(table.statFor(993, 'dot'), 'expertise');
+        assert.strictEqual(table.get(984).scaling.dot.stat, 'attack', 'only the current rank counts, not "Next rank"');
+        assert.strictEqual(table.statFor(984, 'dot'), 'expertise', 'every DoT tick scales with Expertise');
+        assert.strictEqual(table.statFor(3, 'dot'), 'expertise');
+        assert.strictEqual(table.statFor(500, 'hit'), 'expertise', 'elemental without a Stats line');
+        assert.strictEqual(table.statFor(3, 'hit'), 'attack');
+        assert.strictEqual(table.statFor(999999, 'hit'), 'unknown');
+        assert.strictEqual(parseScaling('[Stats: 3x heal]').heal, true);
+    });
+
+    await check('bundled snapshot of the live game data', () => {
+        const data = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src', 'dps', 'powers-snapshot.json'), 'utf8'));
+        const t = new PowerTable(data);
+        assert.ok(t.size > 2000);
+        const p = t.get(993);
+        assert.strictEqual(p.label, 'Poison Strike');
+        assert.strictEqual(p.rank, 10);
+        assert.strictEqual(p.scaling.hit.mult, 1.49);
+        assert.strictEqual(p.scaling.dot.stat, 'expertise');
+    });
+
+    console.log('Tracker');
+    await check('only the own body and its summons count; friendly targets and heals ignored', () => {
+        const t = new CombatTracker('t');
+        const dmg = [];
+        const casts = [];
+        t.on('damage', (e) => dmg.push(e));
+        t.on('cast', (e) => casts.push(e));
+        const feed = (buf, dir) => (dir === 'down' ? t.fromServer(buf[0] * 256 + buf[1], buf.subarray(4)) : t.fromClient(buf[0] * 256 + buf[1], buf.subarray(4)));
+        feed(pkt.fullUpdate(12, 'ksq', { isPlayer: true }));
+        feed(pkt.fullUpdate(40, 'NecroSkeleton', { summoner: 12, power: 4000 }));
+        feed(pkt.spawn(301, 'GoblinBrute', false, 2), 'down');
+        feed(pkt.spawn(77, 'MediaTek', true, 1), 'down');
+        feed(pkt.cast(12, 993));
+        feed(pkt.cast(301, 5)); // a mob this client owns casting
+        feed(pkt.hit(301, 12, 1000, 993, false));
+        feed(pkt.hit(301, 40, 300, 4000, false)); // summon
+        feed(pkt.hit(12, 301, 999, 5, false)); // mob hits us
+        feed(pkt.hit(77, 12, 50, 993, false)); // party member
+        feed(pkt.hit(12, 12, -400, 993, false)); // heal on self
+        feed(pkt.dot(301, 12, 993, 200));
+        feed(pkt.dot(301, 12, 993, 200), 'down'); // server echo of the same tick: skipped
+        feed(pkt.dot(302, 12, 993, 150), 'down'); // tick run by another client: counted
+        assert.strictEqual(casts.length, 1);
+        assert.deepStrictEqual(dmg.map((d) => [d.kind, d.damage, d.powerId, d.targetName]), [
+            ['hit', 1000, 993, 'GoblinBrute'],
+            ['hit', 300, 4000, 'GoblinBrute'],
+            ['dot', 200, 993, 'GoblinBrute'],
+            ['dot', 150, 993, '']
+        ]);
+        assert.strictEqual(dmg[1].summon.name, 'NecroSkeleton');
+    });
+
+    console.log('Meter');
+    await check('timer, totals, DPS, per spell, scaling split, crits, casts', () => {
+        let now = 1000000;
+        const m = new DpsMeter({ powers: table, now: () => now });
+        m.recordDamage({ kind: 'hit', powerId: 993, damage: 500 });
+        assert.strictEqual(m.snapshot().ignored.hits, 1, 'not counted before Start');
+        m.start();
+        m.recordCast({ powerId: 993 });
+        m.recordDamage({ kind: 'hit', powerId: 993, damage: 1000, crit: true, targetName: 'Goblin' });
+        now += 2000;
+        m.recordDamage({ kind: 'dot', powerId: 993, damage: 400, targetName: 'Goblin' });
+        m.recordCast({ powerId: 3 });
+        m.recordDamage({ kind: 'hit', powerId: 3, damage: 600 });
+        now += 2000;
+        m.stop();
+        now += 5000; // stopped: time doesn't count
+        m.recordDamage({ kind: 'hit', powerId: 3, damage: 999 });
+        const s = m.snapshot();
+        assert.strictEqual(s.elapsedMs, 4000);
+        assert.strictEqual(s.totals.damage, 2000);
+        assert.strictEqual(s.dps, 500);
+        assert.strictEqual(s.totals.casts, 2);
+        assert.strictEqual(s.totals.hits, 2);
+        assert.strictEqual(s.totals.crits, 1);
+        assert.deepStrictEqual(s.byStat, { attack: 1600, expertise: 400, unknown: 0 });
+        const ps = s.equipped.concat(s.others).find((r) => r.key === 'PoisonStrike');
+        assert.deepStrictEqual([ps.damage, ps.casts, ps.hits, ps.dotDamage, ps.rank, ps.critRate, ps.share], [1400, 1, 1, 400, 10, 1, 0.7]);
+        assert.strictEqual(s.ignored.hits, 2);
+        m.start(); // resume
+        now += 1000;
+        assert.strictEqual(m.snapshot().elapsedMs, 5000);
+        m.reset();
+        assert.strictEqual(m.snapshot().totals.damage, 0);
+        assert.strictEqual(m.state, 'idle');
+    });
+
+    await check('auto-start on first hit; first second never divides by less than 1 s', () => {
+        let now = 0;
+        const m = new DpsMeter({ powers: table, now: () => now });
+        m.autoStart = true;
+        m.recordCast({ powerId: 993 });
+        assert.strictEqual(m.state, 'idle');
+        m.recordDamage({ kind: 'hit', powerId: 993, damage: 5000 });
+        now += 100;
+        const s = m.snapshot();
+        assert.strictEqual(s.state, 'running');
+        assert.strictEqual(s.dps, 5000);
+    });
+
+    await check('equipped spells from a scan come first, in hotbar order', () => {
+        const m = new DpsMeter({ powers: table, now: () => 0 });
+        m.setSpellScan({ abilities: [{ key: 'PoisonStrike', rank: 10, scalingText: '1.49x attack, 2x Expertise/s (5s)' }], hotbar: [{ key: 'PoisonStrike', slotKey: '1', name: 'Poison Strike', rank: 10 }, { key: 'Evade', slotKey: 'E', name: 'Evade', rank: 3 }] });
+        const s = m.snapshot();
+        assert.deepStrictEqual(s.equipped.map((r) => [r.key, r.hotkey, r.rank]), [['PoisonStrike', '1', 10], ['Evade', 'E', 3]]);
+        assert.strictEqual(s.equipped[0].scaling, '1.49x attack, 2x Expertise/s (5s)');
+    });
+
+    await check('DPS over time: buckets of the whole fight and the running average', () => {
+        let now = 0;
+        const m = new DpsMeter({ powers: table, now: () => now });
+        m.start();
+        for (let sec = 0; sec < 200; sec++) {
+            now = sec * 1000 + 500;
+            m.recordDamage({ kind: 'hit', powerId: 3, damage: sec < 100 ? 1000 : 3000 });
+        }
+        now = 200000;
+        m.stop();
+        const g = m.snapshot().dpsSeries;
+        assert.strictEqual(g.bucketSec, 3, '200 s in at most 90 points');
+        assert.strictEqual(g.perSecond.length, 67);
+        assert.strictEqual(g.perSecond[0], 1000);
+        assert.strictEqual(g.perSecond[66], 3000);
+        assert.strictEqual(g.perSecond[34], 2600, 'seconds 102-104: 5-second windows of 2200, 2600 and 3000');
+        assert.strictEqual(g.running[66], 2000, 'the last running value is the fight DPS');
+        assert.strictEqual(g.peak, 3000);
+    });
+
+    await check('basic attacks: melee or ranged from the power\'s TargetMethod, whatever the combo field says', () => {
+        let now = 0;
+        const m = new DpsMeter({ powers: table, now: () => now });
+        assert.strictEqual(m.castKind(1094, { isMelee: true, id: 1 }, false), 'ranged', 'Bone Daggers are thrown');
+        assert.strictEqual(m.castKind(1094, null, false), 'ranged');
+        assert.strictEqual(m.castKind(969, { isMelee: false, id: 1 }, true), 'melee');
+        assert.strictEqual(m.castKind(993, null, false), 'spell');
+        m.start();
+        m.recordCast({ powerId: 969, combo: { isMelee: true, id: 1 } });
+        m.recordDamage({ kind: 'hit', powerId: 969, damage: 10 });
+        m.recordCast({ powerId: 1094, combo: { isMelee: true, id: 1 } });
+        m.recordDamage({ kind: 'hit', powerId: 1094, damage: 10 });
+        m.recordCast({ powerId: 1094, combo: { isMelee: true, id: 2 } });
+        m.recordDamage({ kind: 'hit', powerId: 1094, damage: 10 });
+        m.recordDamage({ kind: 'dot', powerId: 1094, damage: 5 });
+        assert.strictEqual(m.snapshot().rotation.text, 'MA1 RA2');
+    });
+
+    await check('a skill\'s follow-up powers and legendary rune count for the skill, as one cast', () => {
+        let now = 0;
+        const m = new DpsMeter({ powers: table, now: () => now });
+        m.start();
+        m.recordCast({ powerId: 1184 }); // Mist Walk: the dash does no damage itself
+        now = 700;
+        m.recordCast({ powerId: 1185 }); // its closing strike, cast by the game
+        m.recordDamage({ kind: 'dot', powerId: 1185, damage: 400 });
+        m.recordDamage({ kind: 'dot', powerId: 8032, damage: 100 }); // the Bleed a legendary rune adds
+        m.recordCast({ powerId: 969, combo: { isMelee: true, id: 1 } });
+        m.recordDamage({ kind: 'hit', powerId: 969, damage: 50 });
+        const s = m.snapshot();
+        const rows = s.equipped.concat(s.others);
+        const mw = rows.find((r) => r.key === 'MistWalk');
+        assert.deepStrictEqual([mw.label, mw.casts, mw.damage, mw.dotDamage, mw.slot], ['Mist Walk', 1, 500, 500, 4]);
+        assert.ok(!rows.some((r) => /Mist Walk/.test(r.label) && r.key !== 'MistWalk'), 'no separate Mist Walk rows under other damage');
+        assert.strictEqual(s.totals.casts, 2, 'the follow-up is not another cast');
+        assert.strictEqual(s.rotation.text, 's4 MA1');
+        assert.strictEqual(s.rotation.entries[0].damage, 500);
+    });
+
+    console.log('Export');
+    await check('JSON, CSV and summary agree with the meter', () => {
+        let now = 0;
+        const m = new DpsMeter({ powers: table, now: () => now });
+        m.start();
+        m.recordCast({ powerId: 993 });
+        m.recordCast({ powerId: 993 });
+        m.recordDamage({ kind: 'hit', powerId: 993, damage: 3000, crit: true, targetName: 'Goblin' });
+        m.recordDamage({ kind: 'dot', powerId: 993, damage: 1000, targetName: 'Goblin' });
+        now = 10000;
+        m.stop();
+        const meta = { source: 'test', character: 'ksq', className: 'Rogue' };
+        const j = exporter.toJson(m.report(), meta);
+        assert.deepStrictEqual([j.format, j.version, j.source], ['dbb-dps', 2, 'test']);
+        assert.strictEqual(j.fight.damage, 4000);
+        assert.strictEqual(j.fight.dps, 400);
+        assert.strictEqual(j.fight.casts, 2);
+        assert.strictEqual(j.fight.duration, '0:10.0');
+        assert.strictEqual(j.spells[0].key, 'PoisonStrike');
+        assert.strictEqual(j.spells[0].casts, 2);
+        assert.strictEqual(j.distribution.byStat.attack.share, 0.75);
+        assert.strictEqual(j.distribution.byKind.dot.damage, 1000);
+        assert.deepStrictEqual(j.hits[0], { atMs: 0, powerId: 993, damage: 3000, crit: true, kind: 'hit', target: 'Goblin', summon: null });
+        assert.deepStrictEqual(j.rotation.steps, ['PoisonStrike', 'PoisonStrike']);
+        assert.strictEqual(j.rotation.casts[1].damage, 4000, 'both hits and the tick go to the latest cast of the power');
+        const csv = exporter.toCsv(m.report(), meta).split('\r\n');
+        assert.ok(csv[0].startsWith('Spell,Rank,Hotbar key,Casts'));
+        assert.ok(csv[1].startsWith('Poison Strike,10,1,2,1,1,100,4000,100,400'), csv[1]);
+        const sum = exporter.toSummary(m.report(), meta);
+        assert.ok(sum.includes('400 DPS, 4,000 damage, 2 casts, 1 hits (100% crit)'), sum);
+        assert.ok(sum.includes('1. Poison Strike r10: 4,000 (100%), 2 casts'), sum);
+        assert.ok(sum.includes('Rotation: s1 s1'), sum);
+    });
+
+    await check('rotation: spells as s<slot>, basic attacks as MA/RA runs counted by hits, DoTs per cast', () => {
+        let now = 0;
+        const m = new DpsMeter({ powers: table, now: () => now });
+        m.start();
+        m.recordCast({ powerId: 3, combo: { isMelee: true, id: 1 } });
+        m.recordDamage({ kind: 'hit', powerId: 3, damage: 100 });
+        now = 400;
+        m.recordCast({ powerId: 3, combo: { isMelee: true, id: 2 } });
+        m.recordDamage({ kind: 'hit', powerId: 3, damage: 120, crit: true });
+        m.recordDamage({ kind: 'hit', powerId: 3, damage: 80 }); // a second target: another reading
+        now = 900;
+        m.recordCast({ powerId: 993 });
+        m.recordDamage({ kind: 'hit', powerId: 993, damage: 3000 });
+        m.recordDamage({ kind: 'hit', powerId: 993, damage: 3100 });
+        now = 1900;
+        m.recordDamage({ kind: 'dot', powerId: 993, damage: 500 });
+        m.recordCast({ powerId: 3 }); // no combo field: a basic attack by its power, and it misses
+        now = 2000;
+        m.recordCast({ powerId: 3, combo: { isMelee: false, id: 1 } }); // ranged: a new run
+        m.recordDamage({ kind: 'hit', powerId: 3, damage: 70 });
+        m.recordCast({ powerId: 3, combo: { isMelee: false, id: 2 } });
+        m.recordDamage({ kind: 'hit', powerId: 3, damage: 75 });
+        m.recordCast({ powerId: 4000 }); // a monster power that does nothing: not listed
+        now = 2600;
+        m.recordCast({ powerId: 500 }); // hotbar slot 5 (E)
+        m.recordCast({ powerId: 993 });
+        m.recordDamage({ kind: 'dot', powerId: 993, damage: 600 }); // after the recast: the new cast's
+        const r = m.snapshot().rotation;
+        assert.deepStrictEqual(r.entries.map((e) => e.badge), ['MA3', 's1', 'RA2', 's5', 's1'], 'the missed melee run is left out');
+        assert.strictEqual(r.text, 'MA3 s1 RA2 s5 s1');
+        assert.deepStrictEqual(r.entries.map((e) => e.damage), [300, 6600, 145, 0, 600]);
+        assert.deepStrictEqual(r.entries.map((e) => e.casts), [2, 1, 2, 1, 1]);
+        assert.deepStrictEqual([r.entries[1].hits, r.entries[1].dotDamage, r.entries[0].crits], [2, 500, 1]);
+        assert.deepStrictEqual(r.entries.map((e) => e.slotKey), ['', '1', '', 'E', '1']);
+        assert.strictEqual(r.casts, 7);
+        const s = m.snapshot();
+        assert.deepStrictEqual(s.equipped.map((v) => [v.key, v.slot, v.hotkey]), [['PoisonStrike', 1, '1'], ['FireBolt', 5, 'E']], 'without a scan, used hotbar spells in slot order');
+        const j = exporter.toJson(m.report(), { source: 't' });
+        assert.deepStrictEqual(j.rotation.steps, ['basic', 'basic', 'PoisonStrike', 'basic', 'basic', 'FireBolt', 'PoisonStrike']);
+        assert.deepStrictEqual(j.rotation.casts.map((c) => c.label), ['MA3', 's1', 'RA2', 's5', 's1']);
+        assert.strictEqual(j.rotation.text, 'MA3 s1 RA2 s5 s1');
+        assert.deepStrictEqual([j.rotation.casts[0].casts, j.rotation.casts[0].hits, j.rotation.casts[3].slotKey], [2, 3, 'E']);
+        const csv = exporter.toCsv(m.report(), { character: 'ksq' });
+        assert.ok(csv.includes('\r\nRotation,Time (s),Shown as,Spell,Kind,Casts,Damage'), csv);
+        assert.ok(csv.includes('\r\n2,0.9,s1,Poison Strike,spell,1,6600,6100,500,2,0\r\n'), csv);
+        assert.ok(exporter.toSummary(m.report(), {}).includes('Rotation: MA3 s1 RA2 s5 s1'));
+        const g = m.snapshot().dpsSeries;
+        assert.deepStrictEqual([g.bucketSec, g.seconds, g.perSecond.length], [1, 2, 2], 'the second in progress is left out');
+        m.reset();
+        assert.strictEqual(m.snapshot().rotation.count, 0);
+    });
+
+    console.log('Spell scans');
+    await check('reads the scanner file format', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbdps-'));
+        const file = path.join(dir, 'DB spells ksq.json');
+        fs.writeFileSync(file, '﻿' + JSON.stringify({ format: 'dbb-spells', version: 1, character: { name: 'ksq', class: 'Rogue' }, spells: { scannedAt: '2026-10-06T15:00:00Z', abilities: [{ key: 'PoisonStrike', rank: 10 }], hotbar: [{ key: 'PoisonStrike', slotKey: '1' }] } }));
+        const s = readScan(file);
+        assert.strictEqual(s.character, 'ksq');
+        assert.strictEqual(s.hotbar[0].slotKey, '1');
+        fs.writeFileSync(file, JSON.stringify({ format: 'dbb-inventory', version: 1, gear: [] }));
+        assert.strictEqual(readScan(file), null, 'a gear-only scan has no spells');
+    });
+
+    console.log('Relay');
+    await check('bytes pass through unchanged both ways; hits reach the meter', async () => {
+        const toServer = [];
+        const fromServerScript = Buffer.concat([pkt.spawn(301, 'GoblinBrute', false, 2), pkt.enterWorld('dungeonblitzr.theminesa.studio', 8080, 'GoblinRiver')]);
+        const upstream = net.createServer((sock) => {
+            sock.on('data', (d) => toServer.push(d));
+            // Answer in awkward pieces.
+            let i = 0;
+            const tick = setInterval(() => {
+                if (i >= fromServerScript.length) {
+                    clearInterval(tick);
+                    return;
+                }
+                sock.write(fromServerScript.subarray(i, i + 7));
+                i += 7;
+            }, 2);
+        });
+        await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+        const relay = new GameRelay({ listenPort: 0, upstreamHost: '127.0.0.1', upstreamPort: upstream.address().port });
+        assert.ok(await relay.listen());
+        const port = relay.server.address().port;
+        const m = new DpsMeter({ powers: table });
+        m.start();
+        let level = '';
+        relay.on('connection', (tr) => {
+            tr.on('damage', (e) => m.recordDamage(e));
+            tr.on('cast', (e) => m.recordCast(e));
+            tr.on('enterWorld', (w) => (level = w.level));
+        });
+        const client = net.connect(port, '127.0.0.1');
+        const received = [];
+        client.on('data', (d) => received.push(d));
+        await new Promise((r) => client.on('connect', r));
+        const clientScript = Buffer.concat([
+            pkt.fullUpdate(12, 'ksq', { isPlayer: true }),
+            pkt.cast(12, 993),
+            pkt.hit(301, 12, 1234, 993, true),
+            pkt.dot(301, 12, 993, 66)
+        ]);
+        for (let i = 0; i < clientScript.length; i += 5) {
+            client.write(clientScript.subarray(i, i + 5));
+            await new Promise((r) => setTimeout(r, 1));
+        }
+        await new Promise((r) => setTimeout(r, 300));
+        assert.ok(Buffer.concat(toServer).equals(clientScript), 'server got exactly what the client sent');
+        assert.ok(Buffer.concat(received).equals(fromServerScript), 'client got exactly what the server sent');
+        const s = m.snapshot();
+        assert.strictEqual(s.totals.damage, 1300);
+        assert.strictEqual(s.totals.casts, 1);
+        assert.strictEqual(level, 'GoblinRiver');
+        client.destroy();
+        await new Promise((r) => setTimeout(r, 50));
+        assert.strictEqual(relay.open.size, 0, 'closing the client closes the pair');
+        relay.close();
+        upstream.close();
+    });
+
+    await check('a refused upstream closes the client instead of hanging', async () => {
+        const dead = net.createServer();
+        await new Promise((r) => dead.listen(0, '127.0.0.1', r));
+        const deadPort = dead.address().port;
+        await new Promise((r) => dead.close(r));
+        const relay = new GameRelay({ listenPort: 0, upstreamHost: '127.0.0.1', upstreamPort: deadPort });
+        await relay.listen();
+        const client = net.connect(relay.server.address().port, '127.0.0.1');
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('client was left open')), 2000);
+            client.on('close', () => {
+                clearTimeout(timer);
+                resolve();
+            });
+            client.on('error', () => {});
+        });
+        relay.close();
+    });
+
+    await check("Flash's policy question is answered locally and never reaches the server", async () => {
+        let reached = 0;
+        const upstream = net.createServer((sock) => {
+            reached += 1;
+            sock.destroy();
+        });
+        await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+        const relay = new GameRelay({ listenPort: 0, upstreamHost: '127.0.0.1', upstreamPort: upstream.address().port });
+        await relay.listen();
+        const answer = await new Promise((resolve) => {
+            const c = net.connect(relay.listenPort, '127.0.0.1', () => {
+                c.write('<policy-file-');
+                setTimeout(() => c.write('request/>\0'), 20);
+            });
+            const got = [];
+            c.on('data', (d) => got.push(d));
+            c.on('close', () => resolve(Buffer.concat(got).toString('latin1')));
+        });
+        assert.strictEqual(answer, POLICY);
+        assert.ok(answer.includes('to-ports="*"'));
+        assert.strictEqual(reached, 0);
+        assert.strictEqual(relay.connections, 0);
+        relay.close();
+        upstream.close();
+    });
+
+    await check('enter world sends the client to a new relay for the next server, which also counts hits', async () => {
+        // A login server that sends the client on to a game server, and the game server.
+        const gameGot = [];
+        const game = net.createServer((sock) => sock.on('data', (d) => gameGot.push(d)));
+        await new Promise((r) => game.listen(0, '127.0.0.1', r));
+        const gamePort = game.address().port;
+        const login = net.createServer((sock) => {
+            sock.once('data', () => {
+                sock.write(pkt.spawn(301, 'GoblinBrute', false, 2));
+                sock.end(pkt.enterWorld('127.0.0.1', gamePort, 'GoblinRiver')); // and hang up, as the server does
+            });
+        });
+        await new Promise((r) => login.listen(0, '127.0.0.1', r));
+        const hub = new RelayHub({ portBase: 0 }); // any free ports
+        const loginRelay = await hub.relayFor('127.0.0.1', login.address().port);
+        const m = new DpsMeter({ powers: table });
+        m.start();
+        const redirects = [];
+        hub.on('connection', (_relay, tr) => tr.on('damage', (e) => m.recordDamage(e)));
+        hub.on('redirect', (_relay, info) => redirects.push(info));
+
+        const c1 = net.connect(loginRelay.listenPort, '127.0.0.1');
+        const got1 = [];
+        c1.on('data', (d) => got1.push(d));
+        await new Promise((r) => c1.on('connect', r));
+        c1.write(pkt.fullUpdate(12, 'ksq', { isPlayer: true }));
+        await new Promise((r) => c1.on('close', r));
+        const frames = [];
+        new P.PacketSplitter((id, payload) => frames.push([id, payload])).push(Buffer.concat(got1));
+        assert.deepStrictEqual(frames.map((f) => f[0]), [0x0f, 0x21], 'both packets arrive, the second after the hang-up');
+        const w = P.parseEnterWorld(frames[1][1]);
+        assert.strictEqual(w.host, '127.0.0.1');
+        assert.notStrictEqual(w.port, gamePort, 'the client is sent to a relay, not the server');
+        assert.strictEqual(w.level, 'GoblinRiver');
+        const gameRelay = hub.find('127.0.0.1', gamePort);
+        assert.ok(gameRelay && gameRelay.listenPort === w.port);
+        assert.deepStrictEqual(redirects.map((r) => r.ok), [true]);
+
+        const c2 = net.connect(w.port, '127.0.0.1');
+        await new Promise((r) => c2.on('connect', r));
+        const script = Buffer.concat([pkt.fullUpdate(12, 'ksq', { isPlayer: true }), pkt.hit(301, 12, 4321, 993, false)]);
+        c2.write(script);
+        await new Promise((r) => setTimeout(r, 150));
+        assert.ok(Buffer.concat(gameGot).equals(script), 'the game server gets what the client sent');
+        assert.strictEqual(m.snapshot().totals.damage, 4321);
+        c2.destroy();
+        hub.close();
+        game.close();
+        login.close();
+    });
+
+    await check('DoT ticks on a training dummy are counted and kept from the server', async () => {
+        const toServer = [];
+        const upstream = net.createServer((sock) => sock.on('data', (d) => toServer.push(d)));
+        await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+        const relay = new GameRelay({ listenPort: 0, upstreamHost: '127.0.0.1', upstreamPort: upstream.address().port });
+        await relay.listen();
+        const m = new DpsMeter({ powers: table });
+        m.start();
+        relay.on('connection', (tr) => tr.on('damage', (e) => m.recordDamage(e)));
+        const c = net.connect(relay.listenPort, '127.0.0.1');
+        await new Promise((r) => c.on('connect', r));
+        const before = Buffer.concat([
+            pkt.fullUpdate(12, 'ksq', { isPlayer: true }),
+            pkt.fullUpdate(900, 'HomeDummy2', { team: 2 }),
+            pkt.hit(900, 12, 5000, 993, false)
+        ]);
+        const dummyTick = pkt.dot(900, 12, 993, 700);
+        const after = Buffer.concat([pkt.dot(301, 12, 993, 300), pkt.cast(12, 993)]);
+        const all = Buffer.concat([before, dummyTick, after]);
+        for (let i = 0; i < all.length; i += 3) {
+            c.write(all.subarray(i, i + 3));
+            await new Promise((r) => setTimeout(r, 1));
+        }
+        await new Promise((r) => setTimeout(r, 200));
+        assert.ok(Buffer.concat(toServer).equals(Buffer.concat([before, after])), 'the server gets everything but the dummy tick');
+        const s = m.snapshot();
+        assert.strictEqual(s.totals.damage, 6000);
+        assert.strictEqual(s.totals.dotDamage, 1000);
+        assert.deepStrictEqual(s.byStat, { attack: 5000, expertise: 1000, unknown: 0 });
+        assert.strictEqual(relay.dummyTicksKept, 1);
+        c.destroy();
+        relay.close();
+        upstream.close();
+    });
+
+    console.log('Web proxy');
+    await check('passes requests through and patches only DungeonBlitz.swf', async () => {
+        const seen = [];
+        const site = http.createServer((req, res) => {
+            const body = [];
+            req.on('data', (d) => body.push(d));
+            req.on('end', () => {
+                seen.push({ url: req.url, headers: req.headers, body: Buffer.concat(body).toString() });
+                if (req.url.startsWith('/p/cbp/DungeonBlitz.swf')) {
+                    res.writeHead(200, { 'content-type': 'application/x-shockwave-flash', 'cache-control': 'no-cache', etag: 'W/"1"' });
+                    res.end('ORIGINAL-SWF');
+                    return;
+                }
+                if (req.url === '/gone') {
+                    res.writeHead(404);
+                    res.end('nope');
+                    return;
+                }
+                res.setHeader('set-cookie', ['a=1; Path=/', 'b=2; Path=/']);
+                res.writeHead(200, { 'content-type': 'text/plain' });
+                res.write('chunk1-');
+                setTimeout(() => res.end('chunk2:' + req.method + ':' + Buffer.concat(body).toString()), 10);
+            });
+        });
+        await new Promise((r) => site.listen(0, '127.0.0.1', r));
+        const sitePort = site.address().port;
+        const proxy = new WebProxy({
+            listenPort: 0,
+            hosts: [{ host: '127.0.0.1', port: sitePort }],
+            patchSwf: async (buf) => ({ swf: Buffer.concat([Buffer.from('PATCHED-'), buf]), report: { ok: true } })
+        });
+        assert.ok(await proxy.listen());
+        const pport = proxy.server.address().port;
+        const ask = (method, url, headers, body, host) =>
+            new Promise((resolve, reject) => {
+                const req = http.request({ host: '127.0.0.1', port: pport, method, path: url, headers: Object.assign({ host: host || '127.0.0.1:' + sitePort }, headers) }, (res) => {
+                    const parts = [];
+                    res.on('data', (d) => parts.push(d));
+                    res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(parts).toString() }));
+                });
+                req.on('error', reject);
+                req.end(body);
+            });
+        const swf = await ask('GET', '/p/cbp/DungeonBlitz.swf?fv=cbp', { 'if-none-match': 'W/"1"', 'accept-encoding': 'gzip' });
+        assert.strictEqual(swf.status, 200);
+        assert.strictEqual(swf.body, 'PATCHED-ORIGINAL-SWF');
+        assert.strictEqual(swf.headers['cache-control'], 'no-store');
+        assert.strictEqual(swf.headers.etag, undefined);
+        assert.strictEqual(Number(swf.headers['content-length']), 'PATCHED-ORIGINAL-SWF'.length);
+        assert.strictEqual(seen[0].headers['if-none-match'], undefined, 'never "not modified" for the SWF');
+        assert.strictEqual(proxy.swf.ok, true);
+        const page = await ask('POST', '/api/thing', { cookie: 'x=1', 'content-type': 'text/plain' }, 'hello');
+        assert.strictEqual(page.body, 'chunk1-chunk2:POST:hello');
+        assert.deepStrictEqual(page.headers['set-cookie'], ['a=1; Path=/', 'b=2; Path=/']);
+        assert.strictEqual(seen[1].headers.cookie, 'x=1');
+        assert.strictEqual(seen[1].headers.host, '127.0.0.1:' + sitePort, 'the Host header goes on as it came');
+        assert.strictEqual((await ask('GET', '/gone')).status, 404);
+        assert.strictEqual((await ask('GET', '/', {}, undefined, 'elsewhere.example')).status, 502, 'other hosts are refused');
+        proxy.close();
+        site.close();
+    });
+
+    const liveSwf = process.env.DBDPS_LIVE_SWF;
+    if (liveSwf && fs.existsSync(liveSwf)) {
+        await check('patches the live DungeonBlitz.swf: login host and port only', () => {
+            const swf = fs.readFileSync(liveSwf);
+            const before = swfpatch.readLoginTarget(swf);
+            assert.ok(before && before.host && before.port, 'login target found');
+            const r = swfpatch.patchSwf(swf, { port: 13690 });
+            assert.strictEqual(r.report.ok, true);
+            assert.deepStrictEqual([r.report.hostPatches, r.report.portPatches, r.report.dummyDotPatches], [1, 1, 1]);
+            assert.deepStrictEqual(swfpatch.readLoginTarget(r.swf), { host: '127.0.0.1', port: 13690 });
+            assert.throws(() => swfpatch.patchSwf(swf, { port: 20000 }), /below 16384/);
+        });
+    }
+
+    console.log('\n' + passed + ' passed, ' + failures.length + ' failed');
+    process.exit(failures.length ? 1 : 0);
+}
+
+main();

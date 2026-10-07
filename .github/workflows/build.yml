@@ -1,0 +1,193 @@
+name: Build
+
+# Every push and pull request: run the checks, build the Windows installer, start the built
+# launcher once (smoke test) and keep the installer as a workflow artifact.
+#
+# Releasing an update (installed launchers pick it up by themselves and offer it in-app):
+#   - Actions > Build > Run workflow, choose patch / minor / major (and optional notes): bumps
+#     package.json, tags vX.Y.Z, builds, checks and publishes the release; or
+#   - push a tag vX.Y.Z whose version matches package.json.
+# The release is created as a draft, gets the installer, its .blockmap and latest.yml (the update
+# feed electron-updater reads), and is published only once all three are up, so no launcher
+# ever sees a release without its update files.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish a release (bumps the version)"
+        type: choice
+        options: [none, patch, minor, major]
+        default: none
+      notes:
+        description: "Release notes (what changed). Empty: GitHub lists the commits."
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}-${{ inputs.release || 'none' }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    name: Checks (Node ${{ matrix.node }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        # 12 is the Node inside Electron 11, which the launcher runs on.
+        node: [12, 20]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Meter (packets, relay, meter, export)
+        run: node test/run.js
+      - name: Launcher (Flash, updates, settings)
+        run: node test/launcher.js
+
+  flash:
+    name: Flash plugin
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: vendor/flash/win32/pepflashplayer64.dll
+          key: flash-32.0.0.363-4acafedca8bb6252
+      - name: Take it out of FlashBrowser's installer
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends innoextract
+          node tools/fetch-flash.js
+      - name: Check it
+        run: node tools/fetch-flash.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flash-plugin
+          path: vendor/flash/win32/pepflashplayer64.dll
+          retention-days: 1
+
+  windows:
+    name: Windows installer
+    needs: [checks, flash]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Release or build
+        id: mode
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $release = "false"
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $tag = $env:GITHUB_REF_NAME
+            if ($tag -ne "v$version") { Write-Error "Tag $tag doesn't match package.json version $version."; exit 1 }
+            $release = "true"
+          } elseif ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.release }}" -ne "none") {
+            if ($env:GITHUB_REF -ne "refs/heads/main") { Write-Error "Releases are made from main."; exit 1 }
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            npm version "${{ inputs.release }}" --no-git-tag-version | Out-Null
+            $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+            git add package.json package-lock.json
+            git commit -m "Release v$version"
+            git tag "v$version"
+            git push origin HEAD:main "v$version"
+            $release = "true"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "release=$release" >> $env:GITHUB_OUTPUT
+          Write-Host "Version $version, release: $release"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: flash-plugin
+          path: vendor/flash/win32
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npx electron-builder --win --x64 --publish never
+
+      - name: Check the update feed
+        shell: pwsh
+        run: |
+          $v = "${{ steps.mode.outputs.version }}"
+          $exe = "dist/DB-DPS-Launcher-Setup-$v.exe"
+          foreach ($f in $exe, "$exe.blockmap", "dist/latest.yml", "dist/win-unpacked/resources/app-update.yml", "dist/win-unpacked/resources/vendor/flash/win32/pepflashplayer64.dll") {
+            if (-not (Test-Path $f)) { Write-Error "Missing $f"; exit 1 }
+          }
+          Get-Content dist/latest.yml
+          Get-Content dist/win-unpacked/resources/app-update.yml
+          if (-not (Select-String -Path dist/latest.yml -Pattern "version: $([regex]::Escape($v))" -Quiet)) { Write-Error "latest.yml names the wrong version"; exit 1 }
+          if (-not (Select-String -Path dist/win-unpacked/resources/app-update.yml -Pattern "repo: db-dpsmod" -Quiet)) { Write-Error "app-update.yml doesn't point at this repository"; exit 1 }
+
+      # Starts the built launcher, loads the game page and checks that Flash runs and the meter
+      # hands it its DungeonBlitz.swf. Flash missing fails the build; the rest depends on the game
+      # website being up, so it's reported but doesn't block a release.
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $out = Join-Path $pwd "smoke.json"
+          $p = Start-Process -FilePath "dist/win-unpacked/DB DPS Launcher.exe" -ArgumentList "--smoke-test=$out" -PassThru
+          if (-not $p.WaitForExit(180000)) { Stop-Process -Id $p.Id -Force; Write-Error "The launcher didn't finish its smoke test"; exit 1 }
+          if (-not (Test-Path $out)) { Write-Error "No smoke test result"; exit 1 }
+          $r = Get-Content $out -Raw | ConvertFrom-Json
+          Get-Content $out
+          if (-not $r.flash) { Write-Error "The packaged launcher didn't find its Flash plugin"; exit 1 }
+          if (-not ($r.plugins -match "Shockwave Flash")) { Write-Error "Chromium didn't load the Flash plugin"; exit 1 }
+          $meter = if ($r.meter) { "proxy listening: $($r.meter.proxyListening), DungeonBlitz.swf served: $($r.meter.swfServed), patched: $($r.meter.swfPatched)" } else { "meter off" }
+          Write-Host "::notice title=Smoke test::Flash $($r.flash.version) loaded; page: $($r.page); overlay on page: $($r.overlayLoaded); launcher menu: $($r.launcherUi); $meter"
+          if (-not $r.ok) { Write-Host "::warning title=Smoke test::The game page or the meter didn't come up fully (see smoke.json above). The game website may be down." }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DB-DPS-Launcher-${{ steps.mode.outputs.version }}
+          path: |
+            dist/DB-DPS-Launcher-Setup-*.exe
+            dist/DB-DPS-Launcher-Setup-*.exe.blockmap
+            dist/latest.yml
+            smoke.json
+
+      - name: Publish the release
+        if: steps.mode.outputs.release == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          $v = "${{ steps.mode.outputs.version }}"
+          $tag = "v$v"
+          $files = @("dist/DB-DPS-Launcher-Setup-$v.exe", "dist/DB-DPS-Launcher-Setup-$v.exe.blockmap", "dist/latest.yml")
+          $notesArgs = @("--generate-notes")
+          if ($env:NOTES) { Set-Content -Path notes.md -Value $env:NOTES -Encoding utf8; $notesArgs = @("--notes-file", "notes.md") }
+          gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @files --clobber
+          } else {
+            gh release create $tag @files --draft --title "DB DPS Launcher $v" @notesArgs
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Published only now, with all three files up: launchers look at published releases only.
+          gh release edit $tag --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "::notice title=Released::$tag is out. Installed launchers find it within the hour (or on their next start) and offer it in the corner menu."

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DB DPS Launcher</title>
+<link rel="stylesheet" href="page.css">
+</head>
+<body>
+<main>
+  <h1>Flash Player is missing</h1>
+  <p>Dungeon Blitz R runs in Adobe Flash Player, which normally comes with the launcher. It isn’t in the launcher’s folder, and the launcher didn’t find another copy it can use on this computer.</p>
+  <p>Reinstalling the launcher puts it back. Or choose a <code>pepflashplayer64.dll</code> yourself: it has to be the 64-bit Pepper build, version 32.0.0.363 or older (later versions stop working after January 2021).</p>
+  <div id="skipped" hidden>
+    <p class="muted">Copies the launcher found and couldn’t use:</p>
+    <ul id="list" class="muted"></ul>
+  </div>
+  <p class="error" id="message" hidden></p>
+  <div class="row">
+    <button class="primary" id="choose" type="button">Choose pepflashplayer64.dll…</button>
+    <button id="releases" type="button">Download the launcher again</button>
+    <button id="logs" type="button">Open the log folder</button>
+  </div>
+</main>
+<script src="noflash.js"></script>
+</body>
+</html>

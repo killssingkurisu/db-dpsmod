@@ -1,0 +1,84 @@
+{
+  "name": "db-dps-launcher",
+  "productName": "DB DPS Launcher",
+  "version": "1.6.0",
+  "description": "A launcher for Dungeon Blitz R with a DPS meter built in",
+  "author": "killssingkurisu",
+  "license": "MIT",
+  "homepage": "https://github.com/killssingkurisu/db-dpsmod",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/killssingkurisu/db-dpsmod.git"
+  },
+  "main": "app/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node test/run.js && node test/launcher.js",
+    "flash": "node tools/fetch-flash.js",
+    "dist": "electron-builder --win --x64 --publish never",
+    "release": "electron-builder --win --x64 --publish always"
+  },
+  "dependencies": {
+    "electron-updater": "4.3.9"
+  },
+  "devDependencies": {
+    "electron": "11.5.0",
+    "electron-builder": "22.14.13"
+  },
+  "build": {
+    "appId": "io.github.killssingkurisu.dbdps",
+    "productName": "DB DPS Launcher",
+    "copyright": "Copyright © 2026 killssingkurisu",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "app/**/*",
+      "src/dps/**/*",
+      "package.json",
+      "!**/*.md"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/flash/win32",
+        "to": "vendor/flash/win32",
+        "filter": [
+          "pepflashplayer64.dll"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "DB-DPS-Launcher-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "runAfterFinish": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "DB DPS Launcher",
+      "uninstallDisplayName": "DB DPS Launcher",
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "killssingkurisu",
+        "repo": "db-dpsmod",
+        "releaseType": "draft"
+      }
+    ]
+  }
+}
