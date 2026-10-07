@@ -60,7 +60,7 @@ The CSV has the spell table, the fight totals and the rotation, one cast per row
 
 Every push builds the installer and runs the checks; nothing is released until you ask for it:
 
-- **From GitHub**: *Actions* → *Build* → *Run workflow* on `main`, pick `patch` (1.6.0 → 1.6.1), `minor` or `major`, and optionally write what changed (the launcher shows it on the update card). The workflow bumps the version, tags it, builds, starts the built launcher once to check that Flash and the meter load, and publishes the release.
+- **From GitHub**: *Actions* → *Build* → *Run workflow* on `main`, pick `patch` (1.6.0 → 1.6.1), `minor` or `major` (or `current` to release the version `package.json` already has), and optionally write what changed (the launcher shows it on the update card). The workflow bumps the version, tags it, builds, starts the built launcher once to check that Flash and the meter load, and publishes the release.
 - **From a clone**: `npm version patch` and `git push --follow-tags`. A pushed tag `vX.Y.Z` releases that version.
 
 A release holds `DB-DPS-Launcher-Setup-x.y.z.exe`, its `.blockmap` and `latest.yml`. The launcher reads `latest.yml` to find the update, and the `.blockmap` lets it download only the parts of the installer that changed. The workflow publishes the release only once all three are uploaded. Installed launchers see it within the hour, or the next time they start.

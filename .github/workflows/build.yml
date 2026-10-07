@@ -5,7 +5,8 @@ name: Build
 #
 # Releasing an update (installed launchers pick it up by themselves and offer it in-app):
 #   - Actions > Build > Run workflow, choose patch / minor / major (and optional notes): bumps
-#     package.json, tags vX.Y.Z, builds, checks and publishes the release; or
+#     package.json, tags vX.Y.Z, builds, checks and publishes the release ("current" releases
+#     the version package.json already has); or
 #   - push a tag vX.Y.Z whose version matches package.json.
 # The release is created as a draft, gets the installer, its .blockmap and latest.yml (the update
 # feed electron-updater reads), and is published only once all three are up, so no launcher
@@ -21,7 +22,7 @@ on:
       release:
         description: "Publish a release (bumps the version)"
         type: choice
-        options: [none, patch, minor, major]
+        options: [none, patch, minor, major, current]
         default: none
       notes:
         description: "Release notes (what changed). Empty: GitHub lists the commits."
@@ -105,11 +106,14 @@ jobs:
             if ($env:GITHUB_REF -ne "refs/heads/main") { Write-Error "Releases are made from main."; exit 1 }
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            npm version "${{ inputs.release }}" --no-git-tag-version | Out-Null
-            $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
-            git add package.json package-lock.json
-            git commit -m "Release v$version"
-            git tag "v$version"
+            if ("${{ inputs.release }}" -ne "current") {
+              npm version "${{ inputs.release }}" --no-git-tag-version | Out-Null
+              $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+              git add package.json package-lock.json
+              git commit -m "Release v$version"
+            }
+            if (git ls-remote --tags origin "refs/tags/v$version") { Write-Error "v$version is already released; pick patch, minor or major."; exit 1 }
+            git tag -a "v$version" -m "DB DPS Launcher $version"
             git push origin HEAD:main "v$version"
             $release = "true"
           }
