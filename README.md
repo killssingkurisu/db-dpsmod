@@ -49,7 +49,7 @@ Nothing on the server changes. Your hits are the ones whose attacker is your cha
 
 ## Export format
 
-`format: "dbb-dps"`, `version: 2`, laid out the way GOOD (the format Genshin Optimizer imports) lays out an inventory: a header, then flat lists of objects that name things by the game's own keys.
+`format: "dbb-dps"`, `version: 2`, laid out the way GOOD lays out an inventory: a header, then flat lists of objects that name things by the game's own keys.
 
 - `character`: `key`, `name`, `class`, `spellScan`.
 - `fight`: `startedAt`, `stoppedAt`, `durationMs`, `duration`, `levels`, `damage`, `dps`, `casts`, `hits`, `crits`, `critRate`, `critDamage`, `dotDamage`, `dotTicks`, `summonDamage`, `outsideTimer`, and with Dungeon mode `dungeon`: `level`, `name`, `completion`, `state`, `endedBy` (`boss`, `cleared`, `complete`, `left`, `manual`), `deaths`, `idlePauses`, `bosses` (each with `name`, `atMs`, `at`).
