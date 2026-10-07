@@ -817,7 +817,7 @@ class Overlay {
             '<i class="unk" style="width:' + (st.unknown / sum) * 100 + '%"></i>';
         const tip = [r.label + (r.rank ? ', rank ' + r.rank : ''), r.scaling ? 'Stats: ' + r.scaling : ''].filter(Boolean).join('\n');
         // A rune proc is never cast: how many times it went off instead.
-        const procs = (r.triggers || []).reduce((n, t) => n + t.procs, 0);
+        const procs = (r.triggers || []).reduce((n, t) => n + t.crits, 0);
         const count = !r.casts && procs ? int(procs) + ' proc' + (procs === 1 ? '' : 's') : int(r.casts) + ' cast' + (r.casts === 1 ? '' : 's');
         let html =
             '<div class="l1">' +
@@ -854,20 +854,17 @@ class Overlay {
 }
 
 /**
- * A rune proc's damage by the spell whose hit set it off (Hemorrhage: "Assassinate 36%, 16 hits";
- * "Melee 17%, 4 crits" when those hits were crits).
+ * A rune proc's damage by the spell whose critical hits set it off (Hemorrhage: "Assassinate 36%,
+ * 16 crits"): a rune goes off on a critical hit, so every time it went off is a crit by that spell.
  */
 function triggerList(r) {
-    const list = (r.triggers || []).filter((t) => t.damage > 0 || t.procs > 0);
+    const list = (r.triggers || []).filter((t) => t.damage > 0 || t.crits > 0);
     if (!list.length) return '';
-    const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
     return (
         '<dt class="head">Set off by</dt>' +
         list
             .map((t) => {
-                let what = '';
-                if (t.procs && t.crits === t.procs) what = plural(t.crits, 'crit');
-                else if (t.procs) what = plural(t.procs, 'hit') + (t.crits ? ' (' + plural(t.crits, 'crit') + ')' : '');
+                const what = t.crits ? t.crits + ' crit' + (t.crits === 1 ? '' : 's') : '';
                 return '<dd class="trig"><span class="who">' + esc(t.label) + '</span><span>' + pct(t.damage, r.damage) + '</span>' + (what ? '<span class="n">' + what + '</span>' : '') + '</dd>';
             })
             .join('')

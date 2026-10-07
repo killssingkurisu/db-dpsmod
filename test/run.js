@@ -494,7 +494,7 @@ async function main() {
             assert.strictEqual(s.rotation.entries[0].damage, 9000, "the clones' damage goes to the Shadow Legion cast");
         });
 
-        await check('Hemorrhage is Attack, split by the hits that set it off; a new bleed adds to what is left of the old', () => {
+        await check('Hemorrhage is Attack, split by the crits that set it off; a new bleed adds to what is left of the old', () => {
             const { m, tick } = fight();
             const hem = id('ProcMassiveTime');
             const assassinate = id('DeathBlowOld10');
@@ -515,14 +515,17 @@ async function main() {
             const s = m.snapshot();
             const h = row(s, 'Hemorrhage');
             assert.deepStrictEqual([h.damage, h.byStat.attack, h.byStat.expertise, h.casts], [8797, 8797, 0, 0]);
-            assert.deepStrictEqual(h.triggers.map((t) => [t.label, t.damage, t.procs, t.crits]), [['Assassinate', 4505, 1, 0], ['Melee', 4292, 1, 1]]);
+            assert.deepStrictEqual(h.triggers.map((t) => [t.label, t.damage, t.crits]), [['Assassinate', 4505, 1], ['Melee', 4292, 1]], 'every time it went off is a crit by that spell');
             assert.strictEqual(h.scaling, '47% of the hit that set it off, every second for 3 s (141% in all)');
             assert.strictEqual(s.byStat.expertise, 0, 'not Expertise in the Scaling bar either');
             const j = exporter.toJson(m.report(), { source: 'test' });
             const hj = j.spells.find((x) => x.name === 'Hemorrhage');
-            assert.deepStrictEqual(hj.triggeredBy.map((t) => [t.key, t.name, t.damage, t.procs, t.crits]), [['DeathBlowOld', 'Assassinate', 4505, 1, 0], ['RapierMelee', 'Melee', 4292, 1, 1]]);
+            assert.deepStrictEqual(hj.triggeredBy, [
+                { key: 'DeathBlowOld', name: 'Assassinate', damage: 4505, share: 0.5122, crits: 1 },
+                { key: 'RapierMelee', name: 'Melee', damage: 4292, share: 0.4878, crits: 1 }
+            ]);
             assert.deepStrictEqual(hj.damageByStat, { attack: 8797, expertise: 0, unknown: 0 });
-            assert.ok(exporter.toCsv(m.report(), {}).includes(',"47% of the hit that set it off, every second for 3 s (141% in all)",Assassinate 51% (1 hit); Melee 49% (1 crit)\r\n'));
+            assert.ok(exporter.toCsv(m.report(), {}).includes(',"47% of the hit that set it off, every second for 3 s (141% in all)",Assassinate 51% (1 crit); Melee 49% (1 crit)\r\n'));
         });
 
         await check("rune procs that hit: the hit that set them off, through Charon's Blades too; a bleed nobody was seen setting off", () => {
@@ -542,8 +545,8 @@ async function main() {
             const s = m.snapshot();
             const fire = row(s, 'Incinerate');
             assert.deepStrictEqual([fire.byStat.attack, fire.scaling], [6000, '60% of the hit that set it off']);
-            assert.deepStrictEqual(fire.triggers.map((t) => [t.label, t.damage, t.procs]), [['Crimson Butterfly', 6000, 1]]);
-            assert.deepStrictEqual(row(s, 'Hemorrhage').triggers.map((t) => [t.label, t.damage, t.procs]), [['Crimson Butterfly', 19185, 1], ['Unknown hit', 500, 0]]);
+            assert.deepStrictEqual(fire.triggers.map((t) => [t.label, t.damage, t.crits]), [['Crimson Butterfly', 6000, 1]]);
+            assert.deepStrictEqual(row(s, 'Hemorrhage').triggers.map((t) => [t.label, t.damage, t.crits]), [['Crimson Butterfly', 19185, 1], ['Unknown hit', 500, 0]]);
             assert.strictEqual(row(s, 'Crimson Butterfly').damage, 50814, 'its own hits are still its own');
         });
 

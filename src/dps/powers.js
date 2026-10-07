@@ -185,10 +185,11 @@ function isMount(name, targetMethod) {
 }
 
 /**
- * Rune procs whose damage is the hit that set them off, not a stat of their own. A hit rolls the
- * player's proc chance (CombatState.method_1200: 15% to start with), a spell's hit whether it
- * crits or not, a basic attack's only when it crits (its ProcModifier is 0), and hands every
- * proc half its final damage (method_72(proc, ..., damage / 2, powerId)); these powers
+ * Rune procs whose damage is the critical hit that set them off, not a stat of their own. Every
+ * hit of a spell, and a basic attack's combo finisher (a basic attack's ProcModifier is 0),
+ * rolls the player's critical chance (CombatState.method_1200; ProcChance, which the data's
+ * Steadiness talent calls CritChance: 15% to start with). A critical hit hands every rune proc
+ * half its final damage (method_72(proc, ..., damage / 2, powerId)); these powers
  * (PowerType.var_470) multiply that by 1 + their bonus and deal it: the elemental runes and
  * Heavy Blow as a hit, Hemorrhage as a bleed.
  */

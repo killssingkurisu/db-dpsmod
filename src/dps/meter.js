@@ -640,7 +640,7 @@ class DpsMeter extends EventEmitter {
             this.lastHits.set(tk, m);
             if (this.lastHits.size > 400) this.lastHits.delete(this.lastHits.keys().next().value);
         }
-        m.set(e.powerId, { key: row.key, label: row.label, damage: amount, crit: Boolean(e.crit), at: this.now() });
+        m.set(e.powerId, { key: row.key, label: row.label, damage: amount, at: this.now() });
     }
 
     /** The hit that set a proc off: your latest hit on that target with the power it names, just before. */
@@ -650,19 +650,21 @@ class DpsMeter extends EventEmitter {
         return h && this.now() - h.at <= TRIGGER_MS ? h : null;
     }
 
-    /** A proc's damage (or, with proc, one more time it went off), for the spell whose hit set it off. */
+    /**
+     * A proc's damage (or, with proc, one more time it went off), for the spell whose hit set it
+     * off. A rune goes off on a critical hit, the roll of your critical chance (ProcChance; the
+     * Steadiness talent is CritChance in the data) that every hit of a spell and a basic attack's
+     * combo finisher make, so each time it went off is a crit by that spell: crits.
+     */
     creditTrigger(row, trig, damage, proc) {
         const key = trig ? trig.key : UNSEEN;
         let t = row.triggers.get(key);
         if (!t) {
-            t = { key, label: (trig && trig.label) || 'Unknown hit', damage: 0, procs: 0, crits: 0 };
+            t = { key, label: (trig && trig.label) || 'Unknown hit', damage: 0, crits: 0 };
             row.triggers.set(key, t);
         }
         t.damage += damage;
-        if (proc) {
-            t.procs += 1;
-            if (trig && trig.crit) t.crits += 1;
-        }
+        if (proc) t.crits += 1;
     }
 
     /** Hemorrhage's bleed on a target, unless it ran out (or the target died) a while ago. */
@@ -1007,8 +1009,8 @@ class DpsMeter extends EventEmitter {
             // A proc's damage by the spell whose hit set it off, biggest first.
             triggers: row.triggers
                 ? Array.from(row.triggers.values())
-                      .sort((a, b) => b.damage - a.damage || b.procs - a.procs)
-                      .map((t) => ({ key: t.key, label: t.label, damage: Math.round(t.damage), share: row.damage ? t.damage / row.damage : 0, procs: t.procs, crits: t.crits }))
+                      .sort((a, b) => b.damage - a.damage || b.crits - a.crits)
+                      .map((t) => ({ key: t.key, label: t.label, damage: Math.round(t.damage), share: row.damage ? t.damage / row.damage : 0, crits: t.crits }))
                 : [],
             description: scan && scan.description ? scan.description : p ? p.description : '',
             damageType: p ? p.damageType : '',
