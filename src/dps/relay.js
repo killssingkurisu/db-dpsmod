@@ -23,6 +23,41 @@ class CombatTracker extends EventEmitter {
         this.recentDots = []; // [at, targetId, powerId, amount] sent by this client, to skip echoes
         this.packets = { up: 0, down: 0 };
         this.dummyTicksKept = 0;
+        this.states = new Map(); // id -> last entState seen (dead = P.ENT_STATE.DEAD)
+        this.isBoss = () => false; // set by the meter: EntName -> whether it's a Boss
+    }
+
+    /**
+     * An entity's state from a 0x07 or 0x08, either way: the client sends them for what it runs
+     * (its own body, its mobs when it is the one running them), the server forwards the rest.
+     * Only a change counts, so a corpse seen for the first time is not a death:
+     *   'died' / 'revived' for the player's own body; 'bossDied' when a Boss dies.
+     */
+    noteState(id, state) {
+        if (!id) return;
+        const before = this.states.get(id);
+        this.states.set(id, state);
+        if (before === undefined || before === state) return;
+        const dead = state === P.ENT_STATE.DEAD;
+        const wasDead = before === P.ENT_STATE.DEAD;
+        if (dead === wasDead) return;
+        if (id === this.ownId) {
+            this.emit(dead ? 'died' : 'revived');
+            return;
+        }
+        const e = this.entities.get(id);
+        if (dead && e && !e.isPlayer && !this.summons.has(id) && this.isBoss(e.name)) {
+            this.emit('bossDied', { id, name: e.name });
+        }
+    }
+
+    /** Dungeon progress, from either direction: 'completion' (percent), 'levelComplete'. */
+    noteLevel(id, payload, from) {
+        if (id === P.PKT.LEVEL_COMPLETION) {
+            this.emit('completion', P.parseLevelCompletion(payload).percent);
+        } else if (id === P.PKT.SET_LEVEL_COMPLETE || id === P.PKT.RECV_LEVEL_COMPLETE) {
+            this.emit('levelComplete', { from });
+        }
     }
 
     isOwnSource(id) {
@@ -58,8 +93,18 @@ class CombatTracker extends EventEmitter {
                 } else if (e.summonerId && this.isOwnSource(e.summonerId)) {
                     this.summons.set(e.id, { name: e.name, powerId: e.powerId });
                 }
+                this.noteState(e.id, e.entState);
                 break;
             }
+            case P.PKT.ENT_INCREMENTAL_UPDATE: {
+                const u = P.parseIncrementalUpdate(payload);
+                this.noteState(u.id, u.entState);
+                break;
+            }
+            case P.PKT.LEVEL_COMPLETION:
+            case P.PKT.SET_LEVEL_COMPLETE:
+                this.noteLevel(id, payload, 'client');
+                break;
             case P.PKT.POWER_CAST: {
                 const c = P.parsePowerCast(payload);
                 if (c.sourceId && c.sourceId === this.ownId) {
@@ -113,8 +158,18 @@ class CombatTracker extends EventEmitter {
             case P.PKT.NEWLY_RELEVANT_ENTITY: {
                 const e = P.parseNewlyRelevantEntity(payload);
                 this.entities.set(e.id, { name: e.name, isPlayer: e.isPlayer, team: e.team });
+                this.states.delete(e.id); // a new entity, or one back in view: nothing known yet
                 break;
             }
+            case P.PKT.ENT_INCREMENTAL_UPDATE: {
+                const u = P.parseIncrementalUpdate(payload);
+                this.noteState(u.id, u.entState);
+                break;
+            }
+            case P.PKT.LEVEL_COMPLETION:
+            case P.PKT.RECV_LEVEL_COMPLETE:
+                this.noteLevel(id, payload, 'server');
+                break;
             case P.PKT.ENTER_WORLD: {
                 this.emit('enterWorld', P.parseEnterWorld(payload));
                 break;

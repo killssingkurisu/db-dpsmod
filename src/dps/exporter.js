@@ -66,6 +66,24 @@ function spellRow(r) {
     };
 }
 
+/** The Dungeon mode run, as the export describes it; null without Dungeon mode. */
+function dungeonOf(s) {
+    const d = s.dungeon;
+    if (!d) return null;
+    return {
+        level: d.runLevel || d.level || '',
+        name: d.runLevelName || d.levelName || '',
+        completion: d.completion === null || d.completion === undefined ? null : d.completion,
+        state: d.phase,
+        endedBy: d.endedBy || null, // boss, cleared, complete, left, manual
+        deaths: d.deaths,
+        idlePauses: d.idlePauses,
+        bosses: (d.bosses || []).map((b) => ({ name: b.name, atMs: b.atMs, at: clock(b.atMs) }))
+    };
+}
+
+const ENDED_BY = { boss: 'boss defeated', cleared: '100% cleared', complete: 'dungeon complete', left: 'left the dungeon', manual: 'stopped' };
+
 /** A rotation step in the DPS Calculator's combo vocabulary: an ability key, or "basic". */
 function stepKey(e) {
     if (e.kind === 'melee' || e.kind === 'ranged') return 'basic';
@@ -147,7 +165,8 @@ function toJson(report, meta) {
             dotDamage: s.totals.dotDamage,
             dotTicks: s.totals.dotTicks,
             summonDamage: s.totals.summonDamage,
-            outsideTimer: s.ignored
+            outsideTimer: s.ignored,
+            dungeon: dungeonOf(s)
         },
         distribution: {
             byStat: {
@@ -174,6 +193,7 @@ function toJson(report, meta) {
             'Damage is what your game client sent to the server for each hit (packet 0x0A) and DoT tick (packet 0x79), including DoT ticks on the house training dummies, which the meter reads but never forwards. The server can add to it afterwards (the Soulthief passive, admin damage scaling), which is not included.',
             'rotation.casts lists the casts (packet 0x09) in order while the timer ran: each hotbar spell cast (slot 1-6 = keys 1, 2, 3, 4, E, Q), runs of basic attacks in a row as one entry (kind melee or ranged, label MA<hits> (melee attack) or RA<hits> (ranged attack), casts = how many; a spell is labelled s<slot>, s1-s6 for keys 1, 2, 3, 4, E, Q), and any other power that dealt damage. Each entry is credited with the hits and DoT ticks of its power until that power is cast again. rotation.text is the same order as shown in the Rotation window ("MA2 s2 s3 RA1 s4 s1"). rotation.steps is the same order as DPS Calculator combo steps, one "basic" per basic attack.',
             'Scaling, as the game client computes damage: every direct hit is BaseDamageMult x Attack, whatever its element (Bitter Blade, Frozen Ward and Frigid Comet included); every DoT tick carries your Expertise from when it landed (Chilblains from Frigid Comet included).',
+            'fight.dungeon is there when Dungeon mode was on: the first hit started the clock; dying, or 3 seconds without damage, paused it at the last hit (durationMs counts fighting time only); endedBy says how the run ended: boss (the Level Complete right after a boss died), cleared (100% completion), complete (Level Complete), left, manual.',
             'Spells: a summon\'s damage counts for the skill that summoned it (Shadow Legion\'s clones); Charon\'s Blades\' ProcCriticalHit counts for Charon\'s Blades, except a hotbar spell\'s hit in its form, which stays with that spell (Crimson Butterfly); a skill\'s other powers count for it (Hailstone Embrace\'s Frost Armor, Black Miasma\'s Shadow Tendril). hits[].spell names the spell each hit counted for. The mount and the procs the client fires by itself are not casts.'
         ]
     };
@@ -208,6 +228,13 @@ function toCsv(report, meta) {
     row(['Attack-scaled damage', s.byStat.attack]);
     row(['Expertise-scaled damage', s.byStat.expertise]);
     row(['Unclassified damage', s.byStat.unknown]);
+    const dungeon = dungeonOf(s);
+    if (dungeon) {
+        row(['Dungeon', dungeon.name || dungeon.level]);
+        row(['Completion %', dungeon.completion === null ? '' : dungeon.completion]);
+        row(['Run ended', dungeon.endedBy ? ENDED_BY[dungeon.endedBy] || dungeon.endedBy : 'not yet']);
+        row(['Deaths', dungeon.deaths]);
+    }
     row(['Exported', new Date().toISOString()]);
     const rotation = report.rotation || [];
     if (rotation.length) {
@@ -229,6 +256,14 @@ function toSummary(report, meta) {
     out.push(who + ', ' + clock(s.elapsedMs));
     out.push(int(s.dps) + ' DPS, ' + int(total) + ' damage, ' + s.totals.casts + ' casts, ' + s.totals.hits + ' hits (' + Math.round(s.critRate * 100) + '% crit)');
     out.push('Attack ' + pct(s.byStat.attack) + ', Expertise ' + pct(s.byStat.expertise) + ', DoT ' + pct(s.totals.dotDamage));
+    const dungeon = dungeonOf(s);
+    if (dungeon) {
+        const bits = [dungeon.name || dungeon.level || 'Dungeon run'];
+        if (dungeon.completion !== null) bits.push(dungeon.completion + '% cleared');
+        if (dungeon.endedBy && !(dungeon.endedBy === 'cleared' && dungeon.completion !== null)) bits.push(ENDED_BY[dungeon.endedBy] || dungeon.endedBy);
+        if (dungeon.deaths) bits.push(dungeon.deaths + (dungeon.deaths === 1 ? ' death' : ' deaths'));
+        out.push('Dungeon: ' + bits.join(', '));
+    }
     let i = 0;
     for (const r of report.rows) {
         if (!r.damage && !r.casts) continue;

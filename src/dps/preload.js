@@ -115,6 +115,11 @@ const CSS = `
 #dbdps .toggle b::after { content: ""; position: absolute; top: 0.1em; left: 0.12em; width: 0.7em; height: 0.7em; border-radius: 50%; background: var(--parch-dim); transition: left 0.12s; }
 #dbdps .toggle[aria-pressed="true"] b { background: #0b4357; border-color: var(--cyan); }
 #dbdps .toggle[aria-pressed="true"] b::after { left: 1.05em; background: var(--cyan); }
+#dbdps .toggle[aria-disabled="true"] { opacity: 0.5; cursor: default; }
+#dbdps .toggles { display: flex; flex-direction: column; gap: 0.45em; }
+#dbdps .dnote { margin: -0.1em 0 0 2.35em; color: var(--parch-dim); }
+#dbdps .dnote.running { color: var(--parch); }
+#dbdps .dnote.ended { color: var(--citrine); }
 #dbdps .status { font-size: 0.82em; color: var(--parch-dim); display: flex; flex-direction: column; gap: 0.3em; border-top: 1px solid var(--brass-dim); padding-top: 0.55em; }
 #dbdps .status .link { display: flex; gap: 0.4em; align-items: baseline; }
 #dbdps .status .link::before { content: ""; width: 0.5em; height: 0.5em; border-radius: 50%; background: var(--brass); flex: none; transform: translateY(-0.05em); }
@@ -307,7 +312,12 @@ class Overlay {
               <button class="btn" data-cmd="export">Export&#8230;</button>
               <button class="btn" data-cmd="copy" data-el="copy">Copy summary</button>
             </div>
-            <button class="toggle" data-cmd="autoStart" data-el="auto" aria-pressed="false"><b></b>Start on first hit</button>
+            <div class="toggles">
+              <button class="toggle" data-cmd="autoStart" data-el="auto" aria-pressed="false"><b></b>Start on first hit</button>
+              <button class="toggle" data-cmd="dungeonMode" data-el="dungeon" aria-pressed="false"
+                title="The first hit starts the timer. Dying, or 3 seconds without damage from you, pauses it at your last hit; your next hit carries on. The run ends when the dungeon is done: its boss defeated or 100% cleared."><b></b>Dungeon mode</button>
+              <p class="note dnote" data-el="dnote" hidden></p>
+            </div>
             <div class="status" data-el="status"></div>
           </section>
           <section class="panel rotpanel" data-panel="rotation" aria-label="Rotation">
@@ -385,7 +395,12 @@ class Overlay {
         }
         const cmd = target.dataset.cmd;
         if (cmd === 'autoStart') {
+            if (this.view && this.view.settings.dungeonMode) return; // Dungeon mode starts on the first hit anyway
             this.send('autoStart', !(this.view && this.view.settings.autoStart));
+            return;
+        }
+        if (cmd === 'dungeonMode') {
+            this.send('dungeonMode', !(this.view && this.view.settings.dungeonMode));
             return;
         }
         if (cmd === 'copy') {
@@ -565,7 +580,12 @@ class Overlay {
         el.casts.textContent = int(t.casts);
         el.hits.textContent = int(t.hits);
         el.crit.textContent = Math.round(m.critRate * 100) + '%';
-        el.auto.setAttribute('aria-pressed', String(Boolean(view.settings.autoStart)));
+        const dungeonMode = Boolean(view.settings.dungeonMode);
+        el.auto.setAttribute('aria-pressed', String(Boolean(view.settings.autoStart) || dungeonMode));
+        el.auto.setAttribute('aria-disabled', String(dungeonMode));
+        el.auto.title = dungeonMode ? 'Dungeon mode starts the timer on your first hit.' : '';
+        el.dungeon.setAttribute('aria-pressed', String(dungeonMode));
+        this.renderDungeon(m.dungeon, m);
 
         // Scaling: damage split by the stat each hit scales with.
         const s = m.byStat;
@@ -625,6 +645,51 @@ class Overlay {
             '<polyline points="' + line + '" fill="none" stroke="#00ccff" stroke-width="1.6" vector-effect="non-scaling-stroke"/>';
         this.el.gpeak.innerHTML = 'best 5 s <b>' + esc(compact(peak)) + '</b>';
         this.el.gend.textContent = mmss(series.seconds);
+    }
+
+    /** The line under Dungeon mode: where the run is, why it paused, how it ended. */
+    renderDungeon(d, m) {
+        const note = this.el.dnote;
+        if (!d) {
+            note.hidden = true;
+            return;
+        }
+        const place = [d.isDungeon ? d.levelName : '', d.completion === null || d.completion === undefined ? '' : d.completion + '% cleared'].filter(Boolean).join(', ');
+        const carryOn = ' Your next hit carries on.';
+        const run = d.runLevelName || 'the dungeon';
+        let text = '';
+        if (d.phase === 'waiting') {
+            const pct = d.completion === null || d.completion === undefined ? '' : ' (' + d.completion + '% cleared)';
+            text = d.isDungeon && d.levelName ? 'Waiting for your first hit in ' + d.levelName + pct + '.' : 'Waiting for your first hit.';
+        } else if (d.phase === 'running') {
+            text = place ? place + '.' : 'Run in progress.';
+        } else if (d.phase === 'paused') {
+            text =
+                d.reason === 'idle'
+                    ? 'Paused: no damage for ' + d.idleSeconds + '\u00a0s.' + carryOn
+                    : d.reason === 'dead'
+                      ? 'Paused: you died.' + carryOn
+                      : d.reason === 'boss'
+                        ? 'Paused: ' + d.lastBoss + ' defeated.' + carryOn
+                        : 'Paused.' + carryOn;
+        } else if (d.phase === 'ended') {
+            const t = clock(m.elapsedMs);
+            text =
+                d.endedBy === 'boss'
+                    ? 'Run complete: ' + d.lastBoss + ' defeated in ' + t + '.'
+                    : d.endedBy === 'cleared'
+                      ? 'Run complete: ' + run + ' 100% cleared in ' + t + '.'
+                      : d.endedBy === 'complete'
+                        ? 'Run complete: ' + run + ' done in ' + t + '.'
+                        : d.endedBy === 'left'
+                          ? 'Run ended when you left ' + run + ', at ' + t + '.'
+                          : 'Run stopped at ' + t + '. Resume carries it on.';
+            if (d.deaths) text += ' ' + d.deaths + (d.deaths === 1 ? ' death.' : ' deaths.');
+            text += d.nextRunPending ? ' Your first hit here starts a new run.' : ' Your first hit in the next dungeon starts a new run.';
+        }
+        note.hidden = !text;
+        note.className = 'note dnote ' + d.phase;
+        if (note.textContent !== text) note.textContent = text;
     }
 
     renderStatus(view) {

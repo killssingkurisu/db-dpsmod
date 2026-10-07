@@ -94,6 +94,20 @@ function parseAbilityXml(xml) {
  */
 const DATA_VERSION = 2;
 
+/**
+ * LevelName -> [displayName, isDungeon]. A dungeon has a rankings board (RankingsURL); towns and
+ * the open zones don't (CraftTown, NewbieRoad "Wolf's End", SwampRoadNorth "Black Rose Mire").
+ */
+function parseLevelXml(xml) {
+    const out = {};
+    const re = /<LevelType LevelName="([^"]+)">([\s\S]*?)<\/LevelType>/g;
+    let m;
+    while ((m = re.exec(xml || ''))) {
+        out[m[1]] = [tag(m[2], 'DisplayName'), tag(m[2], 'RankingsURL') ? 1 : 0];
+    }
+    return out;
+}
+
 /** The compact data set a table is built from: what powers-snapshot.json holds. */
 function dataFromSwz(buf, source) {
     const chunks = unpackSwz(buf);
@@ -106,7 +120,8 @@ function dataFromSwz(buf, source) {
         source: source || 'Game.swz',
         builtAt: new Date().toISOString(),
         powers: parsePowerXml(player, false).concat(parsePowerXml(chunkByRoot(chunks, 'MonsterPowerTypes'), true)),
-        abilities: parseAbilityXml(chunkByRoot(chunks, 'AbilityTypes'))
+        abilities: parseAbilityXml(chunkByRoot(chunks, 'AbilityTypes')),
+        levels: parseLevelXml(chunkByRoot(chunks, 'LevelTypes'))
     };
 }
 
@@ -174,6 +189,7 @@ class PowerTable {
         this.data = data;
         this.byId = new Map();
         this.abilities = data.abilities || {};
+        this.levels = data.levels || {};
         for (const r of data.powers || []) {
             const [id, name, base, display, damageType, mana, cooldown, description, monster, targetMethod, powerGroup, spawned] = r;
             const group = base || name;
@@ -284,6 +300,16 @@ class PowerTable {
         return this.byId.get(id) || null;
     }
 
+    /**
+     * A level's name as the game shows it ("GoblinRiverDungeon" -> "Goblin Camp"), and whether it's a
+     * dungeon. Hard versions share their dungeon's entry.
+     */
+    levelInfo(name) {
+        const n = String(name || '');
+        const l = this.levels[n] || this.levels[n.replace(/Hard$/, '')] || null;
+        return { name: n, displayName: (l && l[0]) || prettify(n.replace(/Hard$/, '')) || n, dungeon: l ? Boolean(l[1]) : /Dungeon|Mission/i.test(n) };
+    }
+
     /** An ability's display name ("SeekingBlades" -> "Charon's Blades"). */
     abilityLabel(key) {
         return this.abilityNames[key] || prettify(key);
@@ -336,4 +362,4 @@ class PowerTable {
     }
 }
 
-module.exports = { PowerTable, dataFromSwz, parseScaling, parsePowerXml, parseAbilityXml, prettify, isProc, isMount, DATA_VERSION };
+module.exports = { PowerTable, dataFromSwz, parseScaling, parsePowerXml, parseAbilityXml, parseLevelXml, prettify, isProc, isMount, DATA_VERSION };

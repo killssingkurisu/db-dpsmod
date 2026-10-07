@@ -108,6 +108,11 @@ const pkt = {
     procHit: (target, source, damage, power, origin, crit) =>
         frame(0x0a, new BitWriter().uint(target).uint(source).sint(damage).uint(power).bool(true).uint(origin).bool(true).uint(2).bool(crit).buffer()),
     dot: (target, source, power, amount) => frame(0x79, new BitWriter().uint(target).uint(source).uint(power).sint(amount).raw(0, 5).buffer()),
+    // 0x07 as LinkUpdater.method_541 writes it: id, dx, dy, dvx, entState (2 bits), flags.
+    move: (id, state) => frame(0x07, new BitWriter().uint(id).sint(3).sint(-2).sint(0).raw(state, 2).bool(true).bool(false).bool(false).bool(false).bool(false).bool(false).buffer()),
+    completion: (percent) => frame(0xb7, new BitWriter().uint(percent).buffer()),
+    setLevelComplete: (percent) => frame(0x3f, new BitWriter().uint(percent).uint(40).uint(3).uint(0).uint(2).uint(1).uint(255).uint(0).buffer()),
+    recvLevelComplete: () => frame(0x87, new BitWriter().uint(97).uint(40).buffer()),
     spawn: (id, name, isPlayer, team) => {
         const w = new BitWriter().uint(id).str(name).raw(isPlayer ? 1 : 0, 1);
         if (isPlayer) w.str('Rogue');
@@ -562,6 +567,217 @@ async function main() {
             t.fromClient(0x0a, pkt.procHit(301, 12, 25000, 1447, 1139, true).subarray(4));
             t.fromClient(0x0a, pkt.hit(301, 12, 900, 969, false).subarray(4));
             assert.deepStrictEqual(seen.map((d) => [d.powerId, d.originId]), [[1447, 1139], [969, undefined]]);
+        });
+    }
+
+    console.log('Dungeon mode');
+    {
+        const live = new PowerTable(JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src', 'dps', 'powers-snapshot.json'), 'utf8')));
+        const make = () => {
+            let now = 100000;
+            const m = new DpsMeter({ powers: live, now: () => now });
+            m.setDungeonMode(true);
+            m.noteLevel('GoblinRiverDungeon');
+            return { m, at: (ms) => (now = 100000 + ms), hit: (dmg) => m.recordDamage({ kind: 'hit', powerId: 969, damage: dmg || 1000, targetName: 'Goblin' }) };
+        };
+        const D = (m) => m.snapshot().dungeon;
+
+        await check('first hit starts; 3 s without damage pauses at the last hit; the next hit carries on', () => {
+            const { m, at, hit } = make();
+            assert.deepStrictEqual([D(m).phase, D(m).levelName, D(m).isDungeon], ['waiting', 'Goblin Camp', true]);
+            at(0);
+            m.recordCast({ powerId: 969, combo: { isMelee: true, id: 1 } }); // a cast alone doesn't start it
+            assert.strictEqual(m.state, 'idle');
+            at(1000);
+            hit();
+            assert.strictEqual(m.state, 'running');
+            at(2500);
+            m.recordDamage({ kind: 'dot', powerId: 969, damage: 300 }); // damage over time keeps it going
+            at(5400);
+            m.tick();
+            assert.strictEqual(m.state, 'running', '2.9 s after the last damage');
+            at(5600);
+            m.tick();
+            assert.deepStrictEqual([m.state, D(m).phase, D(m).reason], ['stopped', 'paused', 'idle']);
+            assert.strictEqual(m.snapshot().elapsedMs, 1500, 'the clock stops at the last damage, not 3 s later');
+            at(20000);
+            hit(); // the next pack
+            assert.deepStrictEqual([m.state, D(m).phase], ['running', 'running']);
+            at(21000);
+            assert.strictEqual(m.snapshot().elapsedMs, 2500);
+            assert.strictEqual(m.snapshot().totals.damage, 2300);
+            assert.strictEqual(D(m).idlePauses, 1);
+        });
+
+        await check('dying pauses; nothing counts until you are back; revive, a cast or your own hit brings you back', () => {
+            const { m, at, hit } = make();
+            at(0);
+            hit();
+            at(800);
+            hit();
+            at(1000);
+            m.playerDied();
+            assert.deepStrictEqual([m.state, D(m).reason, D(m).deaths, m.snapshot().elapsedMs], ['stopped', 'dead', 1, 800]);
+            at(2000);
+            m.recordDamage({ kind: 'dot', powerId: 969, damage: 500 }); // a tick while you're dead
+            assert.deepStrictEqual([m.state, m.snapshot().totals.damage, m.snapshot().ignored.damage], ['stopped', 2000, 500]);
+            at(9000);
+            m.playerRevived();
+            assert.strictEqual(D(m).reason, 'revived');
+            at(9500);
+            hit();
+            assert.strictEqual(m.state, 'running');
+            // A missed revive: casting means you're alive.
+            m.playerDied();
+            m.recordCast({ powerId: 969, combo: { isMelee: true, id: 1 } });
+            assert.strictEqual(D(m).playerDead, false);
+            at(9700);
+            hit();
+            assert.strictEqual(m.state, 'running');
+        });
+
+        await check('a boss pauses; the Level Complete right after ends the run as "boss"; later hits do not count', () => {
+            const { m, at, hit } = make();
+            at(0);
+            hit();
+            at(4000);
+            hit(50000);
+            at(4060);
+            m.bossDied('Tak-Ugo'); // the first of two bosses: a pause, not the end
+            assert.deepStrictEqual([m.state, D(m).phase, D(m).reason, m.snapshot().elapsedMs], ['stopped', 'paused', 'boss', 4000]);
+            at(30000);
+            hit();
+            at(61000);
+            hit(80000);
+            m.levelProgress(87);
+            at(61050);
+            m.bossDied('Tak-Ogg');
+            at(61300);
+            m.levelComplete();
+            const d = D(m);
+            assert.deepStrictEqual([m.state, d.phase, d.endedBy, d.completion], ['stopped', 'ended', 'boss', 87]);
+            assert.deepStrictEqual(d.bosses.map((b) => b.name), ['Tak-Ugo', 'Tak-Ogg']);
+            assert.strictEqual(m.snapshot().elapsedMs, 4000 + 31000);
+            at(62000);
+            hit(); // the leftovers
+            assert.deepStrictEqual([m.state, m.snapshot().ignored.hits], ['stopped', 1]);
+            m.tick();
+            assert.strictEqual(D(m).phase, 'ended');
+        });
+
+        await check('100% completion ends the run as "cleared"; the next dungeon starts a new run on its first hit', () => {
+            const { m, at, hit } = make();
+            at(0);
+            hit(7000);
+            at(1000);
+            m.levelProgress(100);
+            assert.deepStrictEqual([D(m).phase, D(m).endedBy, m.snapshot().elapsedMs], ['ended', 'cleared', 0]);
+            m.levelComplete(); // arrives after: already ended
+            assert.strictEqual(D(m).endedBy, 'cleared');
+            m.noteLevel('CraftTown'); // town: results stay
+            at(60000);
+            hit();
+            assert.deepStrictEqual([m.state, m.snapshot().totals.damage], ['stopped', 7000]);
+            m.noteLevel('SRN_Mission1'); // the next dungeon
+            assert.strictEqual(D(m).nextRunPending, true);
+            assert.strictEqual(m.snapshot().totals.damage, 7000, 'the finished run stays until the first hit there');
+            at(90000);
+            hit(1234);
+            const d = D(m);
+            assert.deepStrictEqual([m.state, d.phase, d.runLevelName, m.snapshot().totals.damage], ['running', 'running', 'Tower of the Tuatara', 1234]);
+        });
+
+        await check('leaving the dungeon ends the run; Stop ends it, Start carries it on', () => {
+            const { m, at, hit } = make();
+            at(0);
+            hit();
+            at(1000);
+            m.stop();
+            assert.deepStrictEqual([D(m).phase, D(m).endedBy], ['ended', 'manual']);
+            at(2000);
+            hit();
+            assert.strictEqual(m.state, 'stopped', 'a stopped run stays stopped');
+            m.start();
+            assert.deepStrictEqual([m.state, D(m).phase], ['running', 'running']);
+            at(2500);
+            hit();
+            at(3000);
+            m.noteLevel('CraftTown');
+            assert.deepStrictEqual([D(m).phase, D(m).endedBy, m.snapshot().elapsedMs], ['ended', 'left', 1500]);
+            m.setDungeonMode(false);
+            assert.strictEqual(m.snapshot().dungeon, null);
+        });
+
+        await check('the relay reports your death and revive, a boss dying, completion and Level Complete', () => {
+            const t = new CombatTracker('test');
+            const seen = [];
+            for (const ev of ['died', 'revived', 'bossDied', 'completion', 'levelComplete']) t.on(ev, (x) => seen.push(ev + (x === undefined ? '' : ' ' + JSON.stringify(x))));
+            t.isBoss = (name) => name === 'GoblinBoss1' || name === 'GoblinBoss2';
+            const up = (b) => t.fromClient(b.readUInt16BE(0), b.subarray(4));
+            const down = (b) => t.fromServer(b.readUInt16BE(0), b.subarray(4));
+            up(pkt.fullUpdate(12, 'ksq', { isPlayer: true }));
+            up(pkt.move(12, 0));
+            up(pkt.move(12, 3));
+            up(pkt.move(12, 3));
+            up(pkt.move(12, 0));
+            // A boss this client runs (solo): its 0x08 names it, its 0x07 says when it dies.
+            up(pkt.fullUpdate(700, 'GoblinBoss1', { team: 2 }));
+            up(pkt.move(700, 0));
+            up(pkt.move(700, 3));
+            // A boss another client runs: the server's 0x0f names it, its 0x07 comes back from the server.
+            down(pkt.spawn(701, 'GoblinBoss2', false, 2));
+            down(pkt.move(701, 0));
+            down(pkt.move(701, 3));
+            // A boss already dead when first seen, and a monster that isn't a boss.
+            down(pkt.spawn(702, 'GoblinBoss2', false, 2));
+            down(pkt.move(702, 3));
+            down(pkt.spawn(703, 'GoblinGrunt', false, 2));
+            down(pkt.move(703, 0));
+            down(pkt.move(703, 3));
+            up(pkt.completion(63));
+            down(pkt.completion(64));
+            up(pkt.setLevelComplete(100));
+            down(pkt.recvLevelComplete());
+            assert.deepStrictEqual(seen, [
+                'died',
+                'revived',
+                'bossDied {"id":700,"name":"GoblinBoss1"}',
+                'bossDied {"id":701,"name":"GoblinBoss2"}',
+                'completion 63',
+                'completion 64',
+                'levelComplete {"from":"client"}',
+                'levelComplete {"from":"server"}'
+            ]);
+        });
+
+        await check("bosses from the game's EntTypes, ranks inherited from parents", () => {
+            const { parseEntTypes, bossesFromXml, BossTable } = require('../src/dps/entities');
+            const xml =
+                '<EntTypes><EntType EntName="GoblinBoss1"><DisplayName>Tak-Ugo</DisplayName><EntRank>Boss</EntRank></EntType>' +
+                '<EntType EntName="GoblinBoss1Hard" parent="GoblinBoss1"><Level>40</Level></EntType>' +
+                '<EntType EntName="GoblinGrunt"><EntRank>Minion</EntRank></EntType></EntTypes>';
+            const types = parseEntTypes(xml);
+            assert.deepStrictEqual(types.get('GoblinBoss1Hard'), { rank: 'Boss', displayName: 'Tak-Ugo' });
+            const b = new BossTable(bossesFromXml(xml));
+            assert.deepStrictEqual([b.has('GoblinBoss1Hard'), b.has('GoblinGrunt'), b.displayName('GoblinBoss1Hard')], [true, false, 'Tak-Ugo']);
+            const bundled = new BossTable(JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src', 'dps', 'bosses-snapshot.json'), 'utf8')));
+            assert.ok(bundled.size > 200);
+            assert.strictEqual(bundled.displayName('BanditBoss'), 'Svagg');
+            assert.ok(!bundled.has('HomeDummy1') && !bundled.has('ShadowLegionClone10'));
+        });
+
+        await check('the export carries the run', () => {
+            const { m, at, hit } = make();
+            at(0);
+            hit(5000);
+            m.levelProgress(100);
+            const j = exporter.toJson(m.report(), { source: 'test', character: 'ksq' });
+            assert.deepStrictEqual(
+                [j.fight.dungeon.level, j.fight.dungeon.name, j.fight.dungeon.completion, j.fight.dungeon.endedBy, j.fight.dungeon.deaths],
+                ['GoblinRiverDungeon', 'Goblin Camp', 100, 'cleared', 0]
+            );
+            assert.ok(exporter.toSummary(m.report(), { character: 'ksq' }).split('\n').includes('Dungeon: Goblin Camp, 100% cleared'));
+            assert.ok(/Completion %,100/.test(exporter.toCsv(m.report(), { character: 'ksq' })));
         });
     }
 

@@ -135,8 +135,17 @@ const PKT = {
     ENT_DESTROY: 0x0d,
     NEWLY_RELEVANT_ENTITY: 0x0f,
     ENTER_WORLD: 0x21,
-    BUFF_TICK_DOT: 0x79
+    /** Client -> server when the dungeon is beaten (Level.method_682): completion %, then stats. */
+    SET_LEVEL_COMPLETE: 0x3f,
+    BUFF_TICK_DOT: 0x79,
+    /** Server -> client: the dungeon is beaten; the client opens its Level Complete screen. */
+    RECV_LEVEL_COMPLETE: 0x87,
+    /** Both ways: the dungeon's completion percent (Level.var_690), whenever its rounded value changes. */
+    LEVEL_COMPLETION: 0xb7
 };
+
+/** Entity.entState values (2 bits). 3 (Entity.const_6) is dead: HP reached 0. */
+const ENT_STATE = { DEAD: 3 };
 
 const TEAM = { UNKNOWN: 0, PLAYER: 1, ENEMY: 2, NPC: 3 };
 
@@ -164,7 +173,32 @@ function parseEntityFullUpdate(payload) {
     }
     const summonerId = r.bool() ? r.uint() : 0;
     const powerId = r.bool() ? r.uint() : 0;
-    return { id, name, team, isPlayer, summonerId, powerId };
+    let entState = 0;
+    try {
+        entState = r.bits(2);
+    } catch (_e) {
+        // a short packet: alive as far as we know
+    }
+    return { id, name, team, isPlayer, summonerId, powerId, entState };
+}
+
+/**
+ * 0x07, both ways: an entity's movement since its last update, and its state (LinkUpdater.method_541:
+ * id, dx, dy, dvx, entState in 2 bits, then flags). The client sends it for what it runs (its own
+ * body, its mobs); the server forwards other clients' to it.
+ */
+function parseIncrementalUpdate(payload) {
+    const r = new BitReader(payload);
+    const id = r.uint();
+    r.sint(); // dx
+    r.sint(); // dy
+    r.sint(); // dvx
+    return { id, entState: r.bits(2) };
+}
+
+/** 0xb7, both ways: the dungeon's completion percent (0-100). */
+function parseLevelCompletion(payload) {
+    return { percent: new BitReader(payload).uint() };
 }
 
 /** 0x09, both directions: a power cast. */
@@ -344,6 +378,9 @@ module.exports = {
     rewriteEnterWorld,
     frame,
     PKT,
+    ENT_STATE,
+    parseIncrementalUpdate,
+    parseLevelCompletion,
     TEAM,
     parseEntityFullUpdate,
     parsePowerCast,

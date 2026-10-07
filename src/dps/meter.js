@@ -24,6 +24,10 @@ const SLOT_KEYS = { 1: '1', 2: '2', 3: '3', 4: '4', 5: 'E', 6: 'Q' };
 const CHARON = 'SeekingBlades';
 /** Procs that are the hit itself, made smaller: they count for the power that hit. */
 const ORIGIN_PROCS = new Set(['ProcGlancingBlow']);
+/** Dungeon mode: no damage from you for this long pauses the clock (at your last hit). */
+const DUNGEON_IDLE_MS = 3000;
+/** A dungeon completing this soon after a boss died was that boss's doing. */
+const BOSS_RECENT_MS = 15000;
 
 /** Up to two capitals of a name, for a power that has no hotbar key: "Poison Strike" -> "PS". */
 function initials(label) {
@@ -55,6 +59,9 @@ class DpsMeter extends EventEmitter {
         this.autoStart = false;
         this.equipped = [];      // [{ group, key, label, rank }] from the latest spell scan
         this.scanAbilities = {}; // group -> ability entry from the scan
+        this.dungeonMode = false;
+        this.playerDead = false;
+        this.place = { level: '', completion: null, complete: false }; // the level you're in
         this.reset();
     }
 
@@ -103,26 +110,53 @@ class DpsMeter extends EventEmitter {
         return this.accumMs + (this._state === 'running' ? Math.max(0, this.now() - this.segmentStart) : 0);
     }
 
+    /** Starts the clock (the Start button, F6, Start on first hit). In Dungeon mode it also carries on a run. */
     start() {
-        if (this._state === 'running') {
-            return;
+        this.begin();
+        if (this.dungeonMode) {
+            this.setPhase('running', '');
+            this.dungeon.fresh = false; // carrying this run on, not starting the next
         }
-        if (this._state === 'idle') {
-            this.startedAt = new Date(this.now()).toISOString();
-        }
-        this._state = 'running';
-        this.segmentStart = this.now();
         this.emit('change');
     }
 
+    /** The clock runs from now. False when it already was running. */
+    begin() {
+        if (this._state === 'running') {
+            return false;
+        }
+        if (this._state === 'idle') {
+            this.startedAt = new Date(this.now()).toISOString();
+            this.dungeon.level = this.place.level;
+        }
+        this._state = 'running';
+        this.segmentStart = this.now();
+        this.dungeon.lastHitAt = this.segmentStart;
+        return true;
+    }
+
+    /** Stops the clock (the Stop button, F6). In Dungeon mode that ends the run; Start carries it on. */
     stop() {
         if (this._state !== 'running') {
             return;
         }
-        this.accumMs += Math.max(0, this.now() - this.segmentStart);
-        this._state = 'stopped';
-        this.stoppedAt = new Date(this.now()).toISOString();
+        this.pauseClock(this.now());
+        if (this.dungeonMode) {
+            this.dungeon.endedBy = 'manual';
+            this.setPhase('ended', 'manual');
+        }
         this.emit('change');
+    }
+
+    /** Stops the clock as of `at` (a wall-clock time between the segment's start and now). */
+    pauseClock(at) {
+        if (this._state !== 'running') {
+            return;
+        }
+        const end = Math.max(this.segmentStart, Math.min(this.now(), at));
+        this.accumMs += end - this.segmentStart;
+        this._state = 'stopped';
+        this.stoppedAt = new Date(end).toISOString();
     }
 
     toggle() {
@@ -149,7 +183,171 @@ class DpsMeter extends EventEmitter {
         this.lastCast = new Map(); // powerId -> its latest rotation entry
         this.lastByKey = new Map(); // spell row key -> its latest cast
         this.lastOverride = new Map(); // skill -> its latest run of enchanted basic attacks
+        this.dungeon = {
+            phase: this.dungeonMode ? 'waiting' : 'off', // waiting, running, paused, ended
+            reason: '', // why paused or ended: idle, dead, revived, boss / boss, cleared, complete, left, manual
+            level: '', // the level the run is in
+            lastHitAt: 0, // wall clock of your latest damage
+            endedBy: '',
+            deaths: 0,
+            idlePauses: 0,
+            bosses: [], // [{ name, atMs }] bosses that died during the run
+            lastBoss: '',
+            lastBossAt: 0,
+            fresh: false // a new dungeon was entered after this run: the next hit starts a new run
+        };
         this.emit('change');
+    }
+
+    /* ---------- Dungeon mode ---------- */
+
+    /**
+     * Dungeon mode: the first hit starts the clock; dying, or no damage from you (hits, DoT ticks,
+     * summons) for 3 seconds, pauses it at your last hit, and your next hit carries on. The run
+     * ends when the dungeon is beaten: the game's Level Complete (the final boss of a boss
+     * dungeon) or 100% completion. Any other boss dying pauses the clock like a lull. Entering
+     * another dungeon after that: the first hit there starts a new run.
+     */
+    setDungeonMode(on) {
+        this.dungeonMode = Boolean(on);
+        const d = this.dungeon;
+        if (!this.dungeonMode) {
+            d.phase = 'off';
+            d.reason = '';
+        } else if (this._state === 'idle') {
+            this.setPhase('waiting', '');
+        } else if (this._state === 'running') {
+            d.lastHitAt = this.now();
+            this.setPhase('running', '');
+        } else if (d.phase === 'off') {
+            this.setPhase('paused', '');
+        }
+        this.emit('change');
+    }
+
+    setPhase(phase, reason) {
+        this.dungeon.phase = phase;
+        this.dungeon.reason = reason || '';
+    }
+
+    /** Called a few times a second: the 3-second rule. */
+    tick() {
+        if (!this.dungeonMode || this._state !== 'running') return;
+        const d = this.dungeon;
+        if (this.now() - d.lastHitAt >= DUNGEON_IDLE_MS) {
+            this.pauseClock(d.lastHitAt);
+            d.idlePauses += 1;
+            this.setPhase('paused', 'idle');
+            this.emit('change');
+        }
+    }
+
+    /** Your character died (its entity state went to dead). */
+    playerDied() {
+        if (this.playerDead) return;
+        this.playerDead = true;
+        const d = this.dungeon;
+        if (this._state !== 'idle' && d.phase !== 'ended') d.deaths += 1;
+        if (this.dungeonMode && this._state === 'running') {
+            this.pauseClock(d.lastHitAt);
+            this.setPhase('paused', 'dead');
+        }
+        this.emit('change');
+    }
+
+    /** Your character is back (revived, respawned, or seen casting or hitting). */
+    playerRevived() {
+        if (!this.playerDead) return;
+        this.playerDead = false;
+        const d = this.dungeon;
+        if (this.dungeonMode && d.phase === 'paused' && d.reason === 'dead') this.setPhase('paused', 'revived');
+        this.emit('change');
+    }
+
+    /** A Boss-rank monster died (name as the game shows it). */
+    bossDied(name) {
+        const d = this.dungeon;
+        d.lastBoss = name || 'A boss';
+        d.lastBossAt = this.now();
+        if (this._state === 'idle' || d.phase === 'ended') return;
+        d.bosses.push({ name: d.lastBoss, atMs: Math.round(this.elapsedMs()) });
+        if (this.dungeonMode && this._state === 'running') {
+            // The killing blow was your last hit, or near enough.
+            this.pauseClock(d.lastHitAt);
+            this.setPhase('paused', 'boss');
+        }
+        this.emit('change');
+    }
+
+    /** The dungeon's completion percent (packet 0xb7). 100 ends a run. */
+    levelProgress(percent) {
+        const p = Math.max(0, Math.min(100, Number(percent) || 0));
+        this.place.completion = p;
+        if (p >= 100) this.endRun('cleared');
+        this.emit('change');
+    }
+
+    /** The game's Level Complete (0x3f from the client, 0x87 from the server). */
+    levelComplete() {
+        this.place.complete = true;
+        this.endRun(this.now() - this.dungeon.lastBossAt < BOSS_RECENT_MS ? 'boss' : 'complete');
+        this.emit('change');
+    }
+
+    endRun(by) {
+        const d = this.dungeon;
+        if (!this.dungeonMode || this._state === 'idle' || d.phase === 'ended') return;
+        if (this._state === 'running') this.pauseClock(d.lastHitAt);
+        d.endedBy = by;
+        this.setPhase('ended', by);
+    }
+
+    /**
+     * Entering a level (0x21). Leaving the run's level ends the run; entering a dungeon after a
+     * run (ended, or elsewhere) makes the next hit start a new one.
+     */
+    noteLevel(level) {
+        if (!level) return;
+        if (this.place.level !== level) {
+            this.place = { level, completion: null, complete: false };
+            this.playerDead = false;
+            const d = this.dungeon;
+            if (this.dungeonMode && this._state !== 'idle') {
+                if (d.level && d.level !== level) this.endRun('left');
+                const info = this.powers && this.powers.levelInfo ? this.powers.levelInfo(level) : { dungeon: /Dungeon|Mission/i.test(level) };
+                if (info.dungeon && d.phase === 'ended') d.fresh = true;
+            }
+        }
+        if (this.levels[this.levels.length - 1] !== level) {
+            this.levels.push(level);
+        }
+        this.emit('change');
+    }
+
+    /** What the Damage Meter window and the export say about the run. */
+    dungeonView() {
+        if (!this.dungeonMode) return null;
+        const d = this.dungeon;
+        const info = this.powers && this.powers.levelInfo && this.place.level ? this.powers.levelInfo(this.place.level) : { name: this.place.level, displayName: this.place.level, dungeon: false };
+        const runInfo = d.level && this.powers && this.powers.levelInfo ? this.powers.levelInfo(d.level) : null;
+        return {
+            phase: d.phase,
+            reason: d.reason,
+            endedBy: d.endedBy,
+            level: this.place.level,
+            levelName: info.displayName || '',
+            isDungeon: Boolean(info.dungeon),
+            completion: this.place.completion,
+            runLevel: d.level,
+            runLevelName: runInfo ? runInfo.displayName : d.level,
+            deaths: d.deaths,
+            idlePauses: d.idlePauses,
+            bosses: d.bosses.slice(-10),
+            lastBoss: d.lastBoss,
+            playerDead: this.playerDead,
+            nextRunPending: d.fresh,
+            idleSeconds: DUNGEON_IDLE_MS / 1000
+        };
     }
 
     /* ---------- input ---------- */
@@ -264,7 +462,21 @@ class DpsMeter extends EventEmitter {
         if (!amount) {
             return;
         }
-        if (this._state !== 'running' && this.autoStart && this._state === 'idle') {
+        // A hit from your own body means you're alive, whatever we missed.
+        if (kind === 'hit' && !summon && this.playerDead) this.playerRevived();
+        if (this.dungeonMode) {
+            if (this.dungeon.fresh) {
+                // The first hit in the next dungeon: a new run.
+                const autoStart = this.autoStart;
+                this.reset();
+                this.autoStart = autoStart;
+            }
+            const d = this.dungeon;
+            if (this._state !== 'running' && d.phase !== 'ended' && !this.playerDead) {
+                this.begin();
+                this.setPhase('running', '');
+            }
+        } else if (this._state !== 'running' && this.autoStart && this._state === 'idle') {
             this.start();
         }
         if (this._state !== 'running') {
@@ -274,6 +486,7 @@ class DpsMeter extends EventEmitter {
             return;
         }
         const t = this.elapsedMs();
+        this.dungeon.lastHitAt = this.now();
         const where = this.resolve(e);
         const row = this.rowFor(where.rowPowerId, { ability: where.ability, summonName: where.summonName });
         const stat = this.powers ? this.powers.statFor(where.rowPowerId, kind) : 'unknown';
@@ -380,6 +593,8 @@ class DpsMeter extends EventEmitter {
      * count (MA3, RA5) goes up with each hit it lands.
      */
     recordCast({ powerId, combo, projectile }) {
+        // Casting means you're alive, whatever we missed.
+        if (this.playerDead) this.playerRevived();
         // A cast alone never starts the clock (auto-start waits for the first hit).
         if (this._state !== 'running') {
             this.ignored.casts += 1;
@@ -500,12 +715,6 @@ class DpsMeter extends EventEmitter {
         };
     }
 
-    noteLevel(level) {
-        if (level && this.levels[this.levels.length - 1] !== level) {
-            this.levels.push(level);
-        }
-    }
-
     /* ---------- output ---------- */
 
     rowView(row, total, seconds) {
@@ -607,7 +816,8 @@ class DpsMeter extends EventEmitter {
             timelineStart: Math.max(0, last - 60),
             levels: this.levels.slice(),
             rotation: this.rotationView(ROTATION_SHOWN),
-            dpsSeries: this.dpsSeries()
+            dpsSeries: this.dpsSeries(),
+            dungeon: this.dungeonView()
         };
     }
 
@@ -664,4 +874,4 @@ class DpsMeter extends EventEmitter {
     }
 }
 
-module.exports = { DpsMeter, initials, isBasicPower, SLOT_KEYS, CHARON };
+module.exports = { DpsMeter, initials, isBasicPower, SLOT_KEYS, CHARON, DUNGEON_IDLE_MS };

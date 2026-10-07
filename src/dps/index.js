@@ -11,6 +11,7 @@ const { WebProxy } = require('./httpProxy');
 const swfpatch = require('./swfpatch');
 const { DpsMeter } = require('./meter');
 const { PowerTable, dataFromSwz, DATA_VERSION } = require('./powers');
+const { BossTable, bossesFromSwz } = require('./entities');
 const { SpellScanStore } = require('./spellScans');
 const exporter = require('./exporter');
 
@@ -157,7 +158,9 @@ class DpsOverlay {
         this.dirty = true;
         this.lastSent = 0;
         this.lastExport = '';
-        this.settings = { autoStart: false, hidden: false, layout: { rects: {} } };
+        this.settings = { autoStart: false, dungeonMode: false, hidden: false, layout: { rects: {} } };
+        this.bosses = new BossTable(null);
+        this.bossesFrom = '';
         this.meter.on('change', () => {
             this.dirty = true;
         });
@@ -198,6 +201,7 @@ class DpsOverlay {
         log('DB DPS Launcher ' + VERSION + ', Electron ' + process.versions.electron);
         this.loadSettings();
         this.meter.autoStart = Boolean(this.settings.autoStart);
+        this.meter.setDungeonMode(Boolean(this.settings.dungeonMode));
 
         // The game page gets the overlay through a session preload; on the launcher's own pages
         // (file://) it does nothing.
@@ -208,6 +212,7 @@ class DpsOverlay {
         ipcMain.handle('dbdps:cmd', (event, cmd, arg) => this.command(event, cmd, arg));
 
         this.loadBundledPowers();
+        this.loadBundledBosses();
         this.scans = new SpellScanStore({ documents: this.app.getPath('documents') });
         this.scans.on('change', (scan) => this.applyScan(scan));
         this.scans.refresh();
@@ -241,7 +246,10 @@ class DpsOverlay {
         const ok = await this.proxy.listen();
         log(ok ? 'Web proxy listening on 127.0.0.1:' + this.proxy.listenPort : "Web proxy couldn't listen on " + this.proxy.listenPort + ': ' + this.proxy.error);
 
-        setInterval(() => this.push(), 250);
+        setInterval(() => {
+            this.meter.tick(); // Dungeon mode's 3-second rule
+            this.push();
+        }, 250);
         setInterval(() => this.checkPresence(), 10000);
         this.app.on('before-quit', () => {
             if (this.hub) this.hub.close();
@@ -271,6 +279,9 @@ class DpsOverlay {
         }
         if (/\/Game\.swz(\?|$)/i.test(r.url) && (r.status === 200 || r.status === 304)) {
             this.loadLivePowers(url.replace(/\?.*$/, ''));
+        }
+        if (/\/Login\.swz(\?|$)/i.test(r.url) && (r.status === 200 || r.status === 304)) {
+            this.loadLiveBosses(url.replace(/\?.*$/, ''));
         }
     }
 
@@ -352,6 +363,27 @@ class DpsOverlay {
         this.dirty = true;
     }
 
+    /** Which monsters are bosses (EntRank Boss), for Dungeon mode: bundled, then the game's own Login.swz. */
+    loadBundledBosses() {
+        try {
+            this.bosses = new BossTable(JSON.parse(fs.readFileSync(path.join(__dirname, 'bosses-snapshot.json'), 'utf8')));
+        } catch (err) {
+            log('No bundled boss list: ' + ((err && err.message) || err));
+        }
+    }
+
+    async loadLiveBosses(url) {
+        if (!url || this.bossesFrom === url) return;
+        this.bossesFrom = url;
+        try {
+            const data = bossesFromSwz(await fetchBuffer(url, 30000), url);
+            this.bosses = new BossTable(data);
+            log('Boss list loaded from ' + url + ' (' + this.bosses.size + ' bosses)');
+        } catch (err) {
+            log('Live boss list unavailable from ' + url + ' (' + ((err && err.message) || err) + '); using the bundled one (' + this.bosses.size + ')');
+        }
+    }
+
     applyScan(scan) {
         this.meter.setSpellScan(scan);
         if (scan && scan.className && (!this.character || scan.character.toLowerCase() === this.character.toLowerCase())) {
@@ -383,6 +415,22 @@ class DpsOverlay {
         });
         tracker.on('cast', (e) => this.meter.recordCast(e));
         tracker.on('damage', (e) => this.meter.recordDamage(e));
+        // Dungeon mode: deaths, bosses and the dungeon's progress.
+        tracker.isBoss = (name) => this.bosses.has(name);
+        tracker.on('died', () => {
+            log('You died');
+            this.meter.playerDied();
+        });
+        tracker.on('revived', () => this.meter.playerRevived());
+        tracker.on('bossDied', ({ name }) => {
+            log('Boss defeated: ' + this.bosses.displayName(name) + ' (' + name + ')');
+            this.meter.bossDied(this.bosses.displayName(name));
+        });
+        tracker.on('completion', (percent) => this.meter.levelProgress(percent));
+        tracker.on('levelComplete', ({ from }) => {
+            log('Dungeon complete (' + from + ')');
+            this.meter.levelComplete();
+        });
         tracker.on('enterWorld', (w) => {
             this.level = w.level || this.level;
             this.meter.noteLevel(this.level);
@@ -528,6 +576,11 @@ class DpsOverlay {
             case 'autoStart':
                 this.settings.autoStart = Boolean(arg);
                 m.autoStart = this.settings.autoStart;
+                this.saveSettings();
+                break;
+            case 'dungeonMode':
+                this.settings.dungeonMode = Boolean(arg);
+                m.setDungeonMode(this.settings.dungeonMode);
                 this.saveSettings();
                 break;
             case 'layout':
