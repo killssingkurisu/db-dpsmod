@@ -485,10 +485,13 @@ class DpsOverlay {
                 text: https ? 'The meter reads the http:// game page only; this one is https.' : 'The game loaded without the meter. Restart the launcher.'
             };
         }
+        const ever = relays.reduce((n, r) => n + r.connections, 0);
         if (this.presence.playing && Date.now() - this.presence.checkedAt < 30000) {
+            // The website answers per computer, so before this launcher has ever connected that
+            // character is most likely in another launcher or a browser.
+            if (!ever) return { state: 'waiting', text: 'A character from this computer is in game in another launcher or browser. Log in here to read hits.' };
             return { state: 'error', text: 'Your character is in game, but not through the meter. Restart the launcher.' };
         }
-        const ever = relays.reduce((n, r) => n + r.connections, 0);
         return { state: 'waiting', text: ever ? 'Waiting for the game to reconnect' : 'Log in to start reading hits' };
     }
 
