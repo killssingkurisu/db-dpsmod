@@ -121,6 +121,10 @@ class CombatTracker extends EventEmitter {
                     // LinkUpdater.method_1092. See DpsMeter.resolve.
                     if (h.animOverrideId && h.animOverrideId !== h.powerId) ev.originId = h.animOverrideId;
                     this.emit('damage', ev);
+                } else if (!h.damage && h.animOverrideId && h.animOverrideId !== h.powerId && this.ownId && h.sourceId === this.ownId && !this.isFriendlyTarget(h.targetId)) {
+                    // A proc that deals no damage itself, landing: Hemorrhage puts its bleed on the
+                    // target this way, sized by the hit that set it off (the power named here).
+                    this.emit('procApplied', { powerId: h.powerId, originId: h.animOverrideId, targetId: h.targetId, targetName: this.targetName(h.targetId) });
                 }
                 break;
             }

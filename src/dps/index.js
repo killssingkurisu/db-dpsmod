@@ -415,6 +415,7 @@ class DpsOverlay {
         });
         tracker.on('cast', (e) => this.meter.recordCast(e));
         tracker.on('damage', (e) => this.meter.recordDamage(e));
+        tracker.on('procApplied', (e) => this.meter.recordProc(e));
         // Dungeon mode: deaths, bosses and the dungeon's progress.
         tracker.isBoss = (name) => this.bosses.has(name);
         tracker.on('died', () => {

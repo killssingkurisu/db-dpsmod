@@ -494,6 +494,59 @@ async function main() {
             assert.strictEqual(s.rotation.entries[0].damage, 9000, "the clones' damage goes to the Shadow Legion cast");
         });
 
+        await check('Hemorrhage is Attack, split by the hits that set it off; a new bleed adds to what is left of the old', () => {
+            const { m, tick } = fight();
+            const hem = id('ProcMassiveTime');
+            const assassinate = id('DeathBlowOld10');
+            assert.deepStrictEqual([live.statFor(hem, 'dot'), live.statFor(id('PoisonStrike10'), 'dot')], ['attack', 'expertise']);
+            m.recordCast({ powerId: assassinate });
+            m.recordDamage({ kind: 'hit', powerId: assassinate, damage: 4107, targetId: 301, targetName: 'CastleLizard1' });
+            m.recordProc({ powerId: hem, originId: assassinate, targetId: 301, targetName: 'CastleLizard1' });
+            tick(1000);
+            m.recordDamage({ kind: 'dot', powerId: hem, damage: 1931, targetId: 301, targetName: 'CastleLizard1' }); // 47% of 4,107
+            tick(1000);
+            m.recordDamage({ kind: 'dot', powerId: hem, damage: 1931, targetId: 301, targetName: 'CastleLizard1' });
+            // A melee crit sets it off again before the last tick: a third of Assassinate's bleed is left.
+            m.recordCast({ powerId: id('RapierMelee'), combo: { isMelee: true, id: 3 } });
+            m.recordDamage({ kind: 'hit', powerId: id('RapierMelee'), damage: 9130, crit: true, targetId: 301, targetName: 'CastleLizard1' });
+            m.recordProc({ powerId: hem, originId: id('RapierMelee'), targetId: 301 });
+            tick(1000);
+            m.recordDamage({ kind: 'dot', powerId: hem, damage: 4935, targetId: 301, targetName: 'CastleLizard1' }); // 47% of 1,369 + 9,130
+            const s = m.snapshot();
+            const h = row(s, 'Hemorrhage');
+            assert.deepStrictEqual([h.damage, h.byStat.attack, h.byStat.expertise, h.casts], [8797, 8797, 0, 0]);
+            assert.deepStrictEqual(h.triggers.map((t) => [t.label, t.damage, t.procs, t.crits]), [['Assassinate', 4505, 1, 0], ['Melee', 4292, 1, 1]]);
+            assert.strictEqual(h.scaling, '47% of the hit that set it off, every second for 3 s (141% in all)');
+            assert.strictEqual(s.byStat.expertise, 0, 'not Expertise in the Scaling bar either');
+            const j = exporter.toJson(m.report(), { source: 'test' });
+            const hj = j.spells.find((x) => x.name === 'Hemorrhage');
+            assert.deepStrictEqual(hj.triggeredBy.map((t) => [t.key, t.name, t.damage, t.procs, t.crits]), [['DeathBlowOld', 'Assassinate', 4505, 1, 0], ['RapierMelee', 'Melee', 4292, 1, 1]]);
+            assert.deepStrictEqual(hj.damageByStat, { attack: 8797, expertise: 0, unknown: 0 });
+            assert.ok(exporter.toCsv(m.report(), {}).includes(',"47% of the hit that set it off, every second for 3 s (141% in all)",Assassinate 51% (1 hit); Melee 49% (1 crit)\r\n'));
+        });
+
+        await check("rune procs that hit: the hit that set them off, through Charon's Blades too; a bleed nobody was seen setting off", () => {
+            const { m, tick } = fight();
+            const crimson = id('ShadowBlade10');
+            const proc = id('ProcCriticalHit');
+            const hem = id('ProcMassiveTime');
+            m.recordCast({ powerId: crimson });
+            m.recordDamage({ kind: 'hit', powerId: crimson, damage: 10000, targetId: 302 });
+            m.recordDamage({ kind: 'hit', powerId: id('ProcFire'), originId: crimson, damage: 6000, targetId: 302 });
+            // In Charon's form the hit is a ProcCriticalHit, and that is what Hemorrhage's packet names.
+            m.recordDamage({ kind: 'hit', powerId: proc, originId: crimson, damage: 40814, targetId: 303 });
+            m.recordProc({ powerId: hem, originId: proc, targetId: 303 });
+            tick(1000);
+            m.recordDamage({ kind: 'dot', powerId: hem, damage: 19185, targetId: 303 });
+            m.recordDamage({ kind: 'dot', powerId: hem, damage: 500, targetId: 304 }); // its bleed went on before the meter saw anything
+            const s = m.snapshot();
+            const fire = row(s, 'Incinerate');
+            assert.deepStrictEqual([fire.byStat.attack, fire.scaling], [6000, '60% of the hit that set it off']);
+            assert.deepStrictEqual(fire.triggers.map((t) => [t.label, t.damage, t.procs]), [['Crimson Butterfly', 6000, 1]]);
+            assert.deepStrictEqual(row(s, 'Hemorrhage').triggers.map((t) => [t.label, t.damage, t.procs]), [['Crimson Butterfly', 19185, 1], ['Unknown hit', 500, 0]]);
+            assert.strictEqual(row(s, 'Crimson Butterfly').damage, 50814, 'its own hits are still its own');
+        });
+
         await check('the mount is never part of the fight: Summon Mount and Dismount', () => {
             const { m, tick } = fight();
             m.recordCast({ powerId: id('RapierMelee'), combo: { isMelee: true, id: 1 } });
@@ -567,6 +620,19 @@ async function main() {
             t.fromClient(0x0a, pkt.procHit(301, 12, 25000, 1447, 1139, true).subarray(4));
             t.fromClient(0x0a, pkt.hit(301, 12, 900, 969, false).subarray(4));
             assert.deepStrictEqual(seen.map((d) => [d.powerId, d.originId]), [[1447, 1139], [969, undefined]]);
+        });
+
+        await check('a proc that lands without damage (Hemorrhage) is reported with the power that set it off', () => {
+            const t = new CombatTracker('test');
+            const seen = [];
+            t.on('procApplied', (p) => seen.push(p));
+            t.on('damage', () => seen.push('damage'));
+            t.fromClient(0x08, pkt.fullUpdate(12, 'ksq', { isPlayer: true }).subarray(4));
+            t.fromClient(0x0a, pkt.hit(301, 12, 4107, 1163, false).subarray(4));
+            t.fromClient(0x0a, pkt.procHit(301, 12, 0, 1540, 1163, false).subarray(4));
+            t.fromClient(0x0a, pkt.hit(301, 12, 0, 1184, false).subarray(4)); // no damage, no origin: nothing
+            t.fromClient(0x0a, pkt.procHit(301, 77, 0, 1540, 1163, false).subarray(4)); // someone else's
+            assert.deepStrictEqual(seen, ['damage', { powerId: 1540, originId: 1163, targetId: 301, targetName: '' }]);
         });
     }
 

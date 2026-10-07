@@ -184,6 +184,22 @@ function isMount(name, targetMethod) {
     return name === 'SummonMount' || name === 'Dismount' || targetMethod === 'Mount';
 }
 
+/**
+ * Rune procs whose damage is the hit that set them off, not a stat of their own. A hit rolls the
+ * player's proc chance (CombatState.method_1200: 15% to start with), a spell's hit whether it
+ * crits or not, a basic attack's only when it crits (its ProcModifier is 0), and hands every
+ * proc half its final damage (method_72(proc, ..., damage / 2, powerId)); these powers
+ * (PowerType.var_470) multiply that by 1 + their bonus and deal it: the elemental runes and
+ * Heavy Blow as a hit, Hemorrhage as a bleed.
+ */
+const CARRIED_PROCS = new Set(['ProcFire', 'ProcIce', 'ProcDeath', 'ProcLife', 'ProcEarth', 'ProcAir', 'ProcMassive', 'ProcMassiveTime']);
+/**
+ * Hemorrhage's bleed (ProcMassiveTimeBuff, BuffType.var_2424) takes that damage as its size, not
+ * the caster's Expertise, and a new one on a bleeding target adds to what is left of the old one
+ * (Buff: size - paid so far + new), then ticks over again.
+ */
+const POOLED_PROCS = new Set(['ProcMassiveTime']);
+
 class PowerTable {
     constructor(data) {
         this.data = data;
@@ -243,6 +259,9 @@ class PowerTable {
                 ability: abilityKey ? this.abilities[abilityKey] : null,
                 basicMelee,
                 proc: !monster && isProc(name, display),
+                // A share of the hit that set it off (Hemorrhage, the elemental runes, Heavy Blow).
+                carriesHit: !monster && CARRIED_PROCS.has(name),
+                pooled: !monster && POOLED_PROCS.has(name),
                 mount: isMount(name, targetMethod),
                 basicOverride: false
             });
@@ -352,8 +371,14 @@ class PowerTable {
      * (AddBuff(type, caster, caster.magicDamage, powerId)), Chilblains from Frigid Comet too.
      * The data agrees: of its Stats terms, every direct one is "Nx attack" and every per-second one
      * "Nx Expertise/s".
+     *
+     * Except a rune proc that carries the hit that set it off (CARRIED_PROCS): its damage is a
+     * share of that hit, which is Attack, so it is Attack too, Hemorrhage's bleed ticks included
+     * (its Stats line says Expertise/s, but the bleed's size is the hit's damage).
      */
     statFor(id, kind) {
+        const p = this.get(id);
+        if (p && p.carriesHit) return 'attack';
         return kind === 'dot' ? 'expertise' : 'attack';
     }
 
@@ -362,4 +387,4 @@ class PowerTable {
     }
 }
 
-module.exports = { PowerTable, dataFromSwz, parseScaling, parsePowerXml, parseAbilityXml, parseLevelXml, prettify, isProc, isMount, DATA_VERSION };
+module.exports = { PowerTable, dataFromSwz, parseScaling, parsePowerXml, parseAbilityXml, parseLevelXml, prettify, isProc, isMount, CARRIED_PROCS, POOLED_PROCS, DATA_VERSION };

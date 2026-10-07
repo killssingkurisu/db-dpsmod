@@ -53,11 +53,28 @@ function simulate(seconds, withScan) {
     let seed = 7;
     const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
     const melee = 969; // RapierMelee
+    const hem = Array.from(table.byId.values()).find((p) => p.name === 'ProcMassiveTime').id; // Hemorrhage
+    // Hemorrhage's bleed, the way the game runs it: a new one adds to what is left and ticks over again.
+    const pool = { size: 0, left: 0, next: 0 };
+    const bleed = (origin, hit, t) => {
+        m.recordProc({ powerId: hem, originId: origin, targetName: 'GoblinBrute' });
+        pool.size = (pool.size * pool.left) / 3 + hit;
+        pool.left = 3;
+        pool.next = t + 10;
+    };
     for (let t = 0; t < seconds * 10; t++) {
         now = t * 100;
+        if (pool.left && t === pool.next) {
+            m.recordDamage({ kind: 'dot', powerId: hem, damage: Math.round(pool.size * 0.47), targetName: 'GoblinBrute' });
+            pool.left -= 1;
+            pool.next = t + 10;
+        }
         if (t % 6 === 0 && !(t % 45 > 30)) {
             m.recordCast({ powerId: melee, combo: { isMelee: true, id: 1 + ((t / 6) % 3) } });
-            m.recordDamage({ kind: 'hit', powerId: melee, damage: 9000 + rnd() * 4000, crit: rnd() < 0.2, targetName: 'GoblinBrute' });
+            const hit = 9000 + rnd() * 4000;
+            const crit = rnd() < 0.2;
+            m.recordDamage({ kind: 'hit', powerId: melee, damage: hit, crit, targetName: 'GoblinBrute' });
+            if (crit && rnd() < 0.5) bleed(melee, Math.round(hit), t);
         }
         if (t % 45 === 3) {
             const id = powerId('PoisonStrike', 10);
@@ -80,8 +97,13 @@ function simulate(seconds, withScan) {
         if (t % 300 === 120) {
             const id = powerId('Assassinate', 10);
             m.recordCast({ powerId: id });
-            for (let k = 0; k < 6; k++) m.recordDamage({ kind: 'hit', powerId: id, damage: 30000 + rnd() * 9000, crit: rnd() < 0.3, targetName: 'GoblinBrute' });
+            for (let k = 0; k < 6; k++) {
+                const hit = Math.round(30000 + rnd() * 9000);
+                m.recordDamage({ kind: 'hit', powerId: id, damage: hit, targetName: 'GoblinBrute' });
+                if (k === 2) bleed(id, hit, t);
+            }
         }
+        if (t % 70 === 21) bleed(powerId('SeverStrike', 10), 24000, t);
         if (t % 97 === 11) m.recordDamage({ kind: 'hit', powerId: 1 + 0, damage: 4000, targetName: 'GoblinBrute' });
     }
     now = seconds * 1000;
@@ -175,6 +197,7 @@ if (require.main === module) (async () => {
         { name: '2k-150pct-early-noscan', w: 1707, h: 889, dpr: 1.5, v: view(simulate(7, false), { scan: null }) },
         { name: '2k-150pct-idle-noscan', w: 1707, h: 889, dpr: 1.5, v: view(new DpsMeter({ powers: table }), { scan: null, link: { state: 'waiting', text: 'Waiting for the game to connect' } }) },
         { name: '1080p-100pct', w: 1920, h: 1009, dpr: 1, v: view(fight) },
+        { name: '2k-150pct-hemorrhage', w: 1707, h: 889, dpr: 1.5, v: view(fight), open: 'Hemorrhage' },
         { name: '1200x800-compact', w: 1184, h: 761, dpr: 1, v: view(fight) },
         { name: '2k-150pct-hidden', w: 1707, h: 889, dpr: 1.5, v: view(fight, { settings: { autoStart: false, hidden: true, layout: { rects: {} } } }) },
         { name: '2k-150pct-moved', w: 1707, h: 889, dpr: 1.5, v: view(fight, { settings: { autoStart: false, hidden: false, layout: { rects: { spells: { x: 1180, y: 120, w: 260, h: 420 }, rotation: { x: 330, y: 560, w: 520, h: 0 } } } } }) },
@@ -196,6 +219,10 @@ if (require.main === module) (async () => {
         if (s.name === '2k-150pct') {
             // Open one spell's details, the way a click would.
             await page.mouse.click(1707 - 100, 120);
+            await page.waitForTimeout(100);
+        }
+        if (s.open) {
+            await page.click('#dbdps .spell:has-text("' + s.open + '")');
             await page.waitForTimeout(100);
         }
         if (s.name === '2k-150pct-moved') {

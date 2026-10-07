@@ -153,6 +153,10 @@ const CSS = `
 #dbdps .spell .more dt { color: var(--parch-dim); }
 #dbdps .spell .more dd { text-align: right; }
 #dbdps .spell .more .desc { grid-column: 1 / -1; color: var(--parch-dim); font-style: italic; padding-top: 0.2em; text-align: left; }
+#dbdps .spell .more .head { grid-column: 1 / -1; color: var(--parch-dim); padding-top: 0.2em; }
+#dbdps .spell .more .trig { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 0 0.6em; padding-left: 0.6em; text-align: left; }
+#dbdps .spell .more .trig .who { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+#dbdps .spell .more .trig .n { flex-basis: 100%; color: var(--parch-dim); font-size: 0.92em; }
 #dbdps .spellpanel.narrow { padding-left: 0.6em; padding-right: 0.6em; }
 #dbdps .spellpanel.narrow .spell { padding: 0.3em 0.25em; }
 #dbdps .spellpanel.narrow .spell .name { white-space: normal; overflow-wrap: anywhere; line-height: 1.15; }
@@ -598,7 +602,7 @@ class Overlay {
         el.legend.innerHTML = legend;
         el.kinds.textContent = t.damage
             ? 'Over time ' + pct(t.dotDamage, t.damage) + ' of damage. Crits ' + pct(t.critDamage, t.damage) + ' of damage.'
-            : 'Direct hits scale with Attack, damage over time with Expertise.';
+            : 'Direct hits scale with Attack, damage over time with Expertise, rune procs like Hemorrhage with the hit that set them off.';
         const ig = m.ignored;
         el.ignored.hidden = !(ig.hits && m.state !== 'running');
         el.ignored.textContent = ig.hits ? int(ig.hits) + ' hit' + (ig.hits === 1 ? '' : 's') + ' (' + short(ig.damage) + ' damage) landed while the timer was stopped and weren’t counted.' : '';
@@ -812,6 +816,9 @@ class Overlay {
             '<i class="exp" style="width:' + (st.expertise / sum) * 100 + '%"></i>' +
             '<i class="unk" style="width:' + (st.unknown / sum) * 100 + '%"></i>';
         const tip = [r.label + (r.rank ? ', rank ' + r.rank : ''), r.scaling ? 'Stats: ' + r.scaling : ''].filter(Boolean).join('\n');
+        // A rune proc is never cast: how many times it went off instead.
+        const procs = (r.triggers || []).reduce((n, t) => n + t.procs, 0);
+        const count = !r.casts && procs ? int(procs) + ' proc' + (procs === 1 ? '' : 's') : int(r.casts) + ' cast' + (r.casts === 1 ? '' : 's');
         let html =
             '<div class="l1">' +
             (r.slot || r.hotkey ? '<kbd>' + esc(r.slot ? String(r.slot) : r.hotkey) + '</kbd>' : '') +
@@ -819,18 +826,22 @@ class Overlay {
             (r.rank ? '<span class="rank">r' + esc(r.rank) + '</span>' : '') +
             '</div>' +
             '<div class="bar"><span class="fill" style="width:' + (fill * 100).toFixed(1) + '%">' + segs + '</span></div>' +
-            '<div class="l2"><span class="dmg">' + short(r.damage) + '</span><span>' + pct(r.damage, total) + '</span><span class="casts">' + int(r.casts) + ' cast' + (r.casts === 1 ? '' : 's') + '</span></div>';
+            '<div class="l2"><span class="dmg">' + short(r.damage) + '</span><span>' + pct(r.damage, total) + '</span><span class="casts">' + count + '</span></div>';
         if (this.open.has(r.key)) {
             html += '<dl class="more">' +
                 '<dt>DPS</dt><dd>' + int(r.dps) + '</dd>' +
-                '<dt>Hits</dt><dd>' + int(r.hits) + '</dd>' +
-                '<dt>Crit rate</dt><dd>' + Math.round(r.critRate * 100) + '%</dd>' +
-                '<dt>Average hit</dt><dd>' + int(r.avgHit) + '</dd>' +
-                '<dt>Biggest hit</dt><dd>' + int(r.maxHit) + '</dd>' +
+                // Damage over time alone (Hemorrhage, Mist Walk's poison) has no hits to describe.
+                (r.hits || !r.dotDamage
+                    ? '<dt>Hits</dt><dd>' + int(r.hits) + '</dd>' +
+                      '<dt>Crit rate</dt><dd>' + Math.round(r.critRate * 100) + '%</dd>' +
+                      '<dt>Average hit</dt><dd>' + int(r.avgHit) + '</dd>' +
+                      '<dt>Biggest hit</dt><dd>' + int(r.maxHit) + '</dd>'
+                    : '') +
                 (r.dotDamage ? '<dt>Over time</dt><dd>' + short(r.dotDamage) + ' (' + int(r.dotTicks) + ' ticks)</dd>' : '') +
                 (r.summonDamage ? '<dt>By summons</dt><dd>' + short(r.summonDamage) + '</dd>' : '') +
                 '<dt>Attack-scaled</dt><dd>' + pct(st.attack, r.damage) + '</dd>' +
                 '<dt>Expertise-scaled</dt><dd>' + pct(st.expertise, r.damage) + '</dd>' +
+                triggerList(r) +
                 (r.scaling ? '<dd class="desc">' + esc(r.scaling) + '</dd>' : '') +
                 '</dl>';
         }
@@ -840,6 +851,27 @@ class Overlay {
             node.title = tip;
         }
     }
+}
+
+/**
+ * A rune proc's damage by the spell whose hit set it off (Hemorrhage: "Assassinate 36%, 16 hits";
+ * "Melee 17%, 4 crits" when those hits were crits).
+ */
+function triggerList(r) {
+    const list = (r.triggers || []).filter((t) => t.damage > 0 || t.procs > 0);
+    if (!list.length) return '';
+    const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+    return (
+        '<dt class="head">Set off by</dt>' +
+        list
+            .map((t) => {
+                let what = '';
+                if (t.procs && t.crits === t.procs) what = plural(t.crits, 'crit');
+                else if (t.procs) what = plural(t.procs, 'hit') + (t.crits ? ' (' + plural(t.crits, 'crit') + ')' : '');
+                return '<dd class="trig"><span class="who">' + esc(t.label) + '</span><span>' + pct(t.damage, r.damage) + '</span>' + (what ? '<span class="n">' + what + '</span>' : '') + '</dd>';
+            })
+            .join('')
+    );
 }
 
 function boot() {

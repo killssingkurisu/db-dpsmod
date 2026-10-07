@@ -34,6 +34,10 @@ const LEAD_IN_MS = 3000;
 /** How far back the cast whose hit (re)starts the clock is looked for, when it took longer to land. */
 const CAUSE_MS = 10000;
 const MAX_HELD = 40;
+/** How long after a hit a proc it set off can still be put down to it (they arrive together). */
+const TRIGGER_MS = 2000;
+/** The key a proc's damage goes under when the hit that set it off wasn't seen. */
+const UNSEEN = '';
 /** A dungeon completing this soon after a boss died was that boss's doing. */
 const BOSS_RECENT_MS = 15000;
 
@@ -57,6 +61,24 @@ function isBasicPower(p) {
 
 function emptyStats() {
     return { attack: 0, expertise: 0, unknown: 0 };
+}
+
+/** Who a hit or tick landed on: the client's entity id, else its name. */
+function targetKeyOf(e) {
+    return e.targetId ? 'id:' + e.targetId : 'name:' + (e.targetName || '');
+}
+
+/** How many ticks a bleed proc's DoT has: one a second, for as long as its Stats line says (Hemorrhage: 3 s). */
+function dotTicks(p) {
+    const d = p && p.scaling ? p.scaling.dot : null;
+    return d && d.seconds > 0 ? Math.round(d.seconds) : 3;
+}
+
+function median(list) {
+    if (!list.length) return 0;
+    const s = list.slice().sort((a, b) => a - b);
+    const m = s.length >> 1;
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
 class DpsMeter extends EventEmitter {
@@ -212,6 +234,8 @@ class DpsMeter extends EventEmitter {
         this.rotation = []; // every cast, in order: see recordCast
         this.rotationSeq = 0;
         this.held = []; // casts made while the clock was stopped, for a moment: see takeLeadIn
+        this.lastHits = new Map(); // target -> Map(powerId -> your latest hit with it): what set a proc off
+        this.pools = new Map(); // target and proc -> the Hemorrhage bleed on it: see recordProc
         this.runId = (this.runId || 0) + 1;
         this.lastCast = new Map(); // powerId -> its latest rotation entry
         this.lastByKey = new Map(); // spell row key -> its latest cast
@@ -346,6 +370,8 @@ class DpsMeter extends EventEmitter {
             this.place = { level, completion: null, complete: false };
             this.playerDead = false;
             this.held = []; // casts in the last level aren't part of a fight in this one
+            this.lastHits = new Map(); // entity ids are the level's own
+            this.pools = new Map();
             const d = this.dungeon;
             if (this.dungeonMode && this._state !== 'idle') {
                 if (d.level && d.level !== level) this.endRun('left');
@@ -438,7 +464,9 @@ class DpsMeter extends EventEmitter {
                 firstAt: 0,
                 lastAt: 0,
                 summon: !ability && Boolean(o.summonName),
-                monster: Boolean(!ability && p && p.monster)
+                monster: Boolean(!ability && p && p.monster),
+                triggers: new Map(), // a proc's damage by the spell whose hit set it off: see creditTrigger
+                ratios: [] // a proc's damage over the hit that set it off, as measured
             };
             this.rows.set(key, row);
         }
@@ -560,6 +588,12 @@ class DpsMeter extends EventEmitter {
         this.totals.damage += amount;
         this.byStat[s] += amount;
 
+        // A rune proc's damage goes to the spells whose hits set it off; your own hits are kept
+        // for a moment, for the procs they set off.
+        const rp = this.powers ? this.powers.get(where.rowPowerId) : null;
+        if (rp && rp.carriesHit) this.creditProc(e, rp, row, amount, kind);
+        else if (kind === 'hit' && !summon) this.noteHit(e, row, amount);
+
         const name = targetName || 'Unknown target';
         const tg = this.targets.get(name) || { name, damage: 0, hits: 0 };
         tg.damage += amount;
@@ -593,6 +627,136 @@ class DpsMeter extends EventEmitter {
             }
         }
         this.emit('change');
+    }
+
+    /* ---------- procs that carry a hit (Hemorrhage, the elemental runes, Heavy Blow) ---------- */
+
+    /** One of your hits, kept as what may set a proc off (a proc's packet names the power that hit). */
+    noteHit(e, row, amount) {
+        const tk = targetKeyOf(e);
+        let m = this.lastHits.get(tk);
+        if (!m) {
+            m = new Map();
+            this.lastHits.set(tk, m);
+            if (this.lastHits.size > 400) this.lastHits.delete(this.lastHits.keys().next().value);
+        }
+        m.set(e.powerId, { key: row.key, label: row.label, damage: amount, crit: Boolean(e.crit), at: this.now() });
+    }
+
+    /** The hit that set a proc off: your latest hit on that target with the power it names, just before. */
+    triggerFor(tk, originId) {
+        const m = originId ? this.lastHits.get(tk) : null;
+        const h = m ? m.get(originId) : null;
+        return h && this.now() - h.at <= TRIGGER_MS ? h : null;
+    }
+
+    /** A proc's damage (or, with proc, one more time it went off), for the spell whose hit set it off. */
+    creditTrigger(row, trig, damage, proc) {
+        const key = trig ? trig.key : UNSEEN;
+        let t = row.triggers.get(key);
+        if (!t) {
+            t = { key, label: (trig && trig.label) || 'Unknown hit', damage: 0, procs: 0, crits: 0 };
+            row.triggers.set(key, t);
+        }
+        t.damage += damage;
+        if (proc) {
+            t.procs += 1;
+            if (trig && trig.crit) t.crits += 1;
+        }
+    }
+
+    /** Hemorrhage's bleed on a target, unless it ran out (or the target died) a while ago. */
+    livePool(pk, p) {
+        const pool = this.pools.get(pk);
+        if (pool && this.now() - pool.at > (dotTicks(p) + 1) * 1000) {
+            this.pools.delete(pk);
+            return null;
+        }
+        return pool || null;
+    }
+
+    /**
+     * A proc landed that deals no damage itself (the tracker's 'procApplied'): Hemorrhage putting
+     * its bleed on a target. The bleed is sized by the hit that set it off, and a new one on a
+     * bleeding target adds to what is left of the old one (the game takes off what it has paid so
+     * far) and ticks over again, so each tick is shared among the hits in it, by size.
+     */
+    recordProc(e) {
+        const p = this.powers ? this.powers.get(e.powerId) : null;
+        if (!p || !p.pooled) return;
+        const tk = targetKeyOf(e);
+        const pk = tk + '|' + p.group;
+        const trig = this.triggerFor(tk, e.originId);
+        let pool = this.livePool(pk, p);
+        if (!pool) {
+            pool = { parts: new Map(), labels: new Map(), ticks: 0, at: 0, measure: 0 };
+            this.pools.set(pk, pool);
+            if (this.pools.size > 400) this.pools.delete(this.pools.keys().next().value);
+        }
+        const left = Math.max(0, 1 - pool.ticks / dotTicks(p));
+        let before = 0;
+        for (const [key, w] of pool.parts) {
+            if (left > 0) {
+                pool.parts.set(key, w * left);
+                before += w * left;
+            } else {
+                pool.parts.delete(key);
+            }
+        }
+        const key = trig ? trig.key : UNSEEN;
+        pool.parts.set(key, (pool.parts.get(key) || 0) + (trig ? trig.damage : before || 1));
+        pool.labels.set(key, trig ? trig.label : '');
+        pool.ticks = 0;
+        pool.at = this.now();
+        // A fresh bleed's first tick against its hit is what the Stats line shows.
+        pool.measure = !before && trig ? trig.damage : 0;
+        if (this._state === 'running') {
+            this.creditTrigger(this.rowFor(p.id), trig, 0, true);
+            this.emit('change');
+        }
+    }
+
+    /** A proc's hit or tick, for the spells whose hits set it off. */
+    creditProc(e, p, row, amount, kind) {
+        const tk = targetKeyOf(e);
+        if (p.pooled && kind === 'dot') {
+            const pk = tk + '|' + p.group;
+            const pool = this.livePool(pk, p);
+            if (!pool || !pool.parts.size) {
+                this.creditTrigger(row, null, amount, false);
+                return;
+            }
+            let total = 0;
+            for (const w of pool.parts.values()) total += w;
+            for (const [key, w] of pool.parts) {
+                this.creditTrigger(row, { key, label: pool.labels.get(key) }, total ? (amount * w) / total : 0, false);
+            }
+            if (pool.measure) {
+                row.ratios.push(amount / pool.measure);
+                if (row.ratios.length > 200) row.ratios.shift();
+                pool.measure = 0;
+            }
+            pool.ticks += 1;
+            pool.at = this.now();
+            if (pool.ticks >= dotTicks(p)) this.pools.delete(pk);
+            return;
+        }
+        // An elemental rune or Heavy Blow: a hit of its own, naming the hit that set it off.
+        const trig = this.triggerFor(tk, e.originId);
+        this.creditTrigger(row, trig, amount, kind === 'hit');
+        if (trig && kind === 'hit') {
+            row.ratios.push(amount / trig.damage);
+            if (row.ratios.length > 200) row.ratios.shift();
+        }
+    }
+
+    /** A proc's Stats line, from what it did: "47% of the hit that set it off, every second for 3 s (141% in all)". */
+    procScaling(row, p) {
+        const r = median(row.ratios || []);
+        const share = r ? Math.round(r * 100) + '% of the hit that set it off' : 'A share of the hit that set it off';
+        if (!p.pooled) return share;
+        const n = dotTicks(p);
+        return share + ', every second for ' + n + ' s' + (r ? ' (' + Math.round(r * n * 100) + '% in all)' : '');
     }
 
     /** The latest rotation entry of a skill: its cast, or a run of the basic attacks it enchants. */
@@ -839,7 +1003,13 @@ class DpsMeter extends EventEmitter {
             avgHit: row.hits ? row.hitDamage / row.hits : 0,
             maxHit: row.maxHit,
             byStat: Object.assign({}, row.byStat),
-            scaling: scan && scan.scalingText ? scan.scalingText : p && p.scaling.text ? p.scaling.text : '',
+            scaling: p && p.carriesHit ? this.procScaling(row, p) : scan && scan.scalingText ? scan.scalingText : p && p.scaling.text ? p.scaling.text : '',
+            // A proc's damage by the spell whose hit set it off, biggest first.
+            triggers: row.triggers
+                ? Array.from(row.triggers.values())
+                      .sort((a, b) => b.damage - a.damage || b.procs - a.procs)
+                      .map((t) => ({ key: t.key, label: t.label, damage: Math.round(t.damage), share: row.damage ? t.damage / row.damage : 0, procs: t.procs, crits: t.crits }))
+                : [],
             description: scan && scan.description ? scan.description : p ? p.description : '',
             damageType: p ? p.damageType : '',
             powerIds: Array.from(row.powerIds),

@@ -36,7 +36,20 @@ function spellKey(r) {
     return r.key.replace(/^(name|power):/, '').replace(/[^A-Za-z0-9]+/g, '');
 }
 
-function spellRow(r) {
+/** What set a rune proc off, for the CSV: "Assassinate 36% (16 hits); Melee 17% (4 crits)". */
+function triggerText(r) {
+    const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+    return (r.triggers || [])
+        .filter((t) => t.damage > 0 || t.procs > 0)
+        .map((t) => {
+            const what = t.procs && t.crits === t.procs ? plural(t.crits, 'crit') : t.procs ? plural(t.procs, 'hit') + (t.crits ? ', ' + plural(t.crits, 'crit') : '') : '';
+            return t.label + ' ' + Math.round(t.share * 100) + '%' + (what ? ' (' + what + ')' : '');
+        })
+        .join('; ');
+}
+
+function spellRow(r, spellOf) {
+    const triggers = (r.triggers || []).filter((t) => t.damage > 0 || t.procs > 0);
     return {
         key: spellKey(r),
         name: r.label,
@@ -60,6 +73,10 @@ function spellRow(r) {
         biggestHit: r.maxHit,
         damageByStat: r.byStat,
         scaling: r.scaling || null,
+        // A rune proc (Hemorrhage, the elemental runes, Heavy Blow): its damage by the spell whose hit set it off.
+        triggeredBy: triggers.length
+            ? triggers.map((t) => ({ key: (spellOf && spellOf.get(t.key)) || null, name: t.label, damage: t.damage, share: round(t.share, 4), procs: t.procs, crits: t.crits }))
+            : null,
         damageType: r.damageType || null,
         description: r.description || null,
         powerIds: r.powerIds
@@ -186,7 +203,7 @@ function toJson(report, meta) {
             },
             crits: { damage: s.totals.critDamage, share: share(s.totals.critDamage), rate: round(s.critRate, 4) }
         },
-        spells: report.rows.map(spellRow),
+        spells: report.rows.map((r) => spellRow(r, spellOf)),
         rotation: {
             text: rotation.filter((e) => e.kind !== 'other').map((e) => e.badge).join(' '),
             steps: rotationSteps(rotation),
@@ -199,7 +216,7 @@ function toJson(report, meta) {
             'Damage is what your game client sent to the server for each hit (packet 0x0A) and DoT tick (packet 0x79), including DoT ticks on the house training dummies, which the meter reads but never forwards. The server can add to it afterwards (the Soulthief passive, admin damage scaling), which is not included.',
             'rotation.casts lists the casts (packet 0x09) in order while the timer ran: each hotbar spell cast (slot 1-6 = keys 1, 2, 3, 4, E, Q), runs of basic attacks in a row as one entry (kind melee or ranged, label MA<hits> (melee attack) or RA<hits> (ranged attack), casts = how many; a spell is labelled s<slot>, s1-s6 for keys 1, 2, 3, 4, E, Q), and any other power that dealt damage. castTimesMs has the time of each of an entry\'s casts, so every basic attack in a run has its own; a run ends when the clock stops. Each entry is credited with the hits and DoT ticks of its power until that power is cast again. rotation.text is the same order as shown in the Rotation window ("MA2 s2 s3 RA1 s4 s1"). rotation.steps is the same order as DPS Calculator combo steps, one "basic" per basic attack.',
             'Times (atMs, endMs, castTimesMs, hits[].atMs) are milliseconds on the meter\'s clock from your first hit, not the time of day (fight.startedAt and stoppedAt are). A hit starts the clock, so the casts that led to the hit that started or restarted it (the cast whose hit it was, anything cast after that, and anything cast in the 3 seconds before) are timed at that moment. Casts made after your last hit, before Dungeon mode noticed the lull, are timed at the moment the clock stopped. outsideTimer.casts counts the casts left out.',
-            'Scaling, as the game client computes damage: every direct hit is BaseDamageMult x Attack, whatever its element (Bitter Blade, Frozen Ward and Frigid Comet included); every DoT tick carries your Expertise from when it landed (Chilblains from Frigid Comet included).',
+            'Scaling, as the game client computes damage: every direct hit is BaseDamageMult x Attack, whatever its element (Bitter Blade, Frozen Ward and Frigid Comet included); every DoT tick carries your Expertise from when it landed (Chilblains from Frigid Comet included). Rune procs (Hemorrhage, the elemental runes, Heavy Blow) are a share of the hit that set them off, so they count as Attack, Hemorrhage\'s bleed ticks included; spells[].triggeredBy splits their damage by the spell whose hit set them off (procs: how many times, crits: how many of those hits were crits), and their scaling is the share measured in this fight.',
             'fight.dungeon is there when Dungeon mode was on: the first hit started the clock; dying, or 3 seconds without damage, paused it at the last hit (durationMs counts fighting time only); endedBy says how the run ended: boss (the Level Complete right after a boss died), cleared (100% completion), complete (Level Complete), left, manual.',
             'Spells: a summon\'s damage counts for the skill that summoned it (Shadow Legion\'s clones); Charon\'s Blades\' ProcCriticalHit counts for Charon\'s Blades, except a hotbar spell\'s hit in its form, which stays with that spell (Crimson Butterfly); a skill\'s other powers count for it (Hailstone Embrace\'s Frost Armor, Black Miasma\'s Shadow Tendril). hits[].spell names the spell each hit counted for. The mount and the procs the client fires by itself are not casts.'
         ]
@@ -215,12 +232,12 @@ function toCsv(report, meta) {
     const s = report.snapshot;
     const lines = [];
     const row = (cells) => lines.push(cells.map(csvCell).join(','));
-    row(['Spell', 'Rank', 'Hotbar key', 'Casts', 'Hits', 'Crits', 'Crit %', 'Damage', '% of total', 'DPS', 'Direct damage', 'DoT damage', 'Average hit', 'Biggest hit', 'Attack-scaled damage', 'Expertise-scaled damage', 'Scales with']);
+    row(['Spell', 'Rank', 'Hotbar key', 'Casts', 'Hits', 'Crits', 'Crit %', 'Damage', '% of total', 'DPS', 'Direct damage', 'DoT damage', 'Average hit', 'Biggest hit', 'Attack-scaled damage', 'Expertise-scaled damage', 'Scales with', 'Set off by']);
     for (const r of report.rows) {
         row([
             r.label, r.rank || '', r.hotkey || '', r.casts, r.hits, r.crits, round(r.critRate * 100, 1), r.damage,
             round(r.share * 100, 1), round(r.dps, 1), r.hitDamage, r.dotDamage, round(r.avgHit, 0), r.maxHit,
-            r.byStat.attack, r.byStat.expertise, r.scaling || ''
+            r.byStat.attack, r.byStat.expertise, r.scaling || '', triggerText(r)
         ]);
     }
     lines.push('');
