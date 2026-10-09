@@ -111,6 +111,8 @@ const pkt = {
     // 0x07 as LinkUpdater.method_541 writes it: id, dx, dy, dvx, entState (2 bits), flags.
     move: (id, state) => frame(0x07, new BitWriter().uint(id).sint(3).sint(-2).sint(0).raw(state, 2).bool(true).bool(false).bool(false).bool(false).bool(false).bool(false).buffer()),
     completion: (percent) => frame(0xb7, new BitWriter().uint(percent).buffer()),
+    // 0x35 as LinkUpdater.method_1797 reads it: the gold, then whether to skip the gold pop-up.
+    gold: (amount, quiet) => frame(0x35, new BitWriter().uint(amount).bool(Boolean(quiet)).buffer()),
     setLevelComplete: (percent) => frame(0x3f, new BitWriter().uint(percent).uint(40).uint(3).uint(0).uint(2).uint(1).uint(255).uint(0).buffer()),
     recvLevelComplete: () => frame(0x87, new BitWriter().uint(97).uint(40).buffer()),
     spawn: (id, name, isPlayer, team) => {
@@ -921,6 +923,51 @@ async function main() {
                 'levelComplete {"from":"client"}',
                 'levelComplete {"from":"server"}'
             ]);
+        });
+
+        await check('gold gained in the dungeon since the last reset, paused or not; Reset and the next run start it over', () => {
+            const { m, at, hit } = make();
+            m.recordGold(50); // picked up before the first hit
+            at(0);
+            hit();
+            m.recordGold(120);
+            at(4000);
+            m.tick(); // a lull: gold is picked up between fights
+            m.recordGold(30);
+            assert.deepStrictEqual([D(m).phase, D(m).gold], ['paused', 200]);
+            m.levelProgress(100);
+            m.recordGold(500); // the boss's, after the run is over
+            assert.deepStrictEqual([D(m).phase, D(m).gold], ['ended', 700]);
+            const j = exporter.toJson(m.report(), { source: 'test' });
+            assert.strictEqual(j.fight.dungeon.gold, 700);
+            assert.ok(exporter.toSummary(m.report(), {}).includes('Dungeon: Goblin Camp, 100% cleared, 700 gold'));
+            assert.ok(exporter.toCsv(m.report(), {}).includes('\r\nGold gained,700\r\n'));
+            m.noteLevel('CraftTown');
+            m.recordGold(999); // selling in town isn't the dungeon's
+            m.noteLevel('SRN_Mission1');
+            m.recordGold(40); // the next dungeon, before its first hit
+            assert.strictEqual(D(m).gold, 700, 'the finished run keeps its gold until the next one starts');
+            at(90000);
+            hit();
+            assert.deepStrictEqual([D(m).phase, D(m).gold], ['running', 40]);
+            m.reset();
+            assert.strictEqual(D(m).gold, 0);
+            m.setDungeonMode(false);
+            m.recordGold(10);
+            assert.strictEqual(m.snapshot().dungeon, null);
+            m.setDungeonMode(true);
+            assert.strictEqual(D(m).gold, 0, 'nothing counts with Dungeon mode off');
+        });
+
+        await check('the relay reports the gold the server gives you', () => {
+            const t = new CombatTracker('test');
+            const seen = [];
+            t.on('gold', (n) => seen.push(n));
+            t.fromServer(0x35, pkt.gold(1234, false).subarray(4));
+            t.fromServer(0x35, pkt.gold(80, true).subarray(4));
+            t.fromServer(0x35, pkt.gold(0, false).subarray(4));
+            assert.deepStrictEqual(seen, [1234, 80]);
+            assert.deepStrictEqual(P.parseReceiveGold(pkt.gold(5000, true).subarray(4)), { amount: 5000, quiet: true });
         });
 
         await check("bosses from the game's EntTypes, ranks inherited from parents", () => {

@@ -120,6 +120,7 @@ const CSS = `
 #dbdps .dnote { margin: -0.1em 0 0 2.35em; color: var(--parch-dim); }
 #dbdps .dnote.running { color: var(--parch); }
 #dbdps .dnote.ended { color: var(--citrine); }
+#dbdps .goldline dd { color: var(--citrine); }
 #dbdps .status { font-size: 0.82em; color: var(--parch-dim); display: flex; flex-direction: column; gap: 0.3em; border-top: 1px solid var(--brass-dim); padding-top: 0.55em; }
 #dbdps .status .link { display: flex; gap: 0.4em; align-items: baseline; }
 #dbdps .status .link::before { content: ""; width: 0.5em; height: 0.5em; border-radius: 50%; background: var(--brass); flex: none; transform: translateY(-0.05em); }
@@ -322,6 +323,8 @@ class Overlay {
                 title="The first hit starts the timer. Dying, or 3 seconds without damage from you, pauses it at your last hit; your next hit carries on. The run ends when the dungeon is done: its boss defeated or 100% cleared."><b></b>Dungeon mode</button>
               <p class="note dnote" data-el="dnote" hidden></p>
             </div>
+            <dl class="facts goldline" data-el="goldline" hidden
+              title="Gold you've gained in the dungeon since the timer was last reset: piles you picked up and rewards. Counted while Dungeon mode is on."><dt>Gold gained</dt><dd data-el="gold"></dd></dl>
             <div class="status" data-el="status"></div>
           </section>
           <section class="panel rotpanel" data-panel="rotation" aria-label="Rotation">
@@ -590,6 +593,8 @@ class Overlay {
         el.auto.title = dungeonMode ? 'Dungeon mode starts the timer on your first hit.' : '';
         el.dungeon.setAttribute('aria-pressed', String(dungeonMode));
         this.renderDungeon(m.dungeon, m);
+        el.goldline.hidden = !m.dungeon;
+        if (m.dungeon) el.gold.textContent = int(m.dungeon.gold || 0);
 
         // Scaling: damage split by the stat each hit scales with.
         const s = m.byStat;

@@ -110,6 +110,15 @@ function simulate(seconds, withScan) {
     return m;
 }
 
+/** A dungeon run with Dungeon mode on and some gold picked up. */
+function dungeonRun() {
+    const m = simulate(83, true);
+    m.noteLevel('GoblinRiverDungeon');
+    m.setDungeonMode(true);
+    for (const g of [412, 96, 1870, 233, 5120]) m.recordGold(g);
+    return m;
+}
+
 function view(m, extra) {
     return Object.assign(
         {
@@ -198,6 +207,7 @@ if (require.main === module) (async () => {
         { name: '2k-150pct-idle-noscan', w: 1707, h: 889, dpr: 1.5, v: view(new DpsMeter({ powers: table }), { scan: null, link: { state: 'waiting', text: 'Waiting for the game to connect' } }) },
         { name: '1080p-100pct', w: 1920, h: 1009, dpr: 1, v: view(fight) },
         { name: '2k-150pct-hemorrhage', w: 1707, h: 889, dpr: 1.5, v: view(fight), open: 'Hemorrhage' },
+        { name: '2k-150pct-dungeon-gold', w: 1707, h: 889, dpr: 1.5, v: view(dungeonRun(), { level: 'GoblinRiverDungeon', settings: { autoStart: true, dungeonMode: true, hidden: false, layout: { rects: {} } } }) },
         { name: '1200x800-compact', w: 1184, h: 761, dpr: 1, v: view(fight) },
         { name: '2k-150pct-hidden', w: 1707, h: 889, dpr: 1.5, v: view(fight, { settings: { autoStart: false, hidden: true, layout: { rects: {} } } }) },
         { name: '2k-150pct-moved', w: 1707, h: 889, dpr: 1.5, v: view(fight, { settings: { autoStart: false, hidden: false, layout: { rects: { spells: { x: 1180, y: 120, w: 260, h: 420 }, rotation: { x: 330, y: 560, w: 520, h: 0 } } } } }) },

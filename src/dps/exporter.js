@@ -92,6 +92,7 @@ function dungeonOf(s) {
         endedBy: d.endedBy || null, // boss, cleared, complete, left, manual
         deaths: d.deaths,
         idlePauses: d.idlePauses,
+        gold: d.gold || 0, // gained in the dungeon since the last reset
         bosses: (d.bosses || []).map((b) => ({ name: b.name, atMs: b.atMs, at: clock(b.atMs) }))
     };
 }
@@ -214,7 +215,7 @@ function toJson(report, meta) {
             'rotation.casts lists the casts (packet 0x09) in order while the timer ran: each hotbar spell cast (slot 1-6 = keys 1, 2, 3, 4, E, Q), runs of basic attacks in a row as one entry (kind melee or ranged, label MA<hits> (melee attack) or RA<hits> (ranged attack), casts = how many; a spell is labelled s<slot>, s1-s6 for keys 1, 2, 3, 4, E, Q), and any other power that dealt damage. castTimesMs has the time of each of an entry\'s casts, so every basic attack in a run has its own; a run ends when the clock stops. Each entry is credited with the hits and DoT ticks of its power until that power is cast again. rotation.text is the same order as shown in the Rotation window ("MA2 s2 s3 RA1 s4 s1"). rotation.steps is the same order as DPS Calculator combo steps, one "basic" per basic attack.',
             'Times (atMs, endMs, castTimesMs, hits[].atMs) are milliseconds on the meter\'s clock from your first hit, not the time of day (fight.startedAt and stoppedAt are). A hit starts the clock, so the casts that led to the hit that started or restarted it (the cast whose hit it was, anything cast after that, and anything cast in the 3 seconds before) are timed at that moment. Casts made after your last hit, before Dungeon mode noticed the lull, are timed at the moment the clock stopped. outsideTimer.casts counts the casts left out.',
             'Scaling, as the game client computes damage: every direct hit is BaseDamageMult x Attack, whatever its element (Bitter Blade, Frozen Ward and Frigid Comet included); every DoT tick carries your Expertise from when it landed (Chilblains from Frigid Comet included). Rune procs (Hemorrhage, the elemental runes, Heavy Blow) go off on a critical hit and are a share of that hit, so they count as Attack, Hemorrhage\'s bleed ticks included; spells[].triggeredBy splits their damage by the spell whose critical hits set them off (crits: how many did), and their scaling is the share measured in this fight.',
-            'fight.dungeon is there when Dungeon mode was on: the first hit started the clock; dying, or 3 seconds without damage, paused it at the last hit (durationMs counts fighting time only); endedBy says how the run ended: boss (the Level Complete right after a boss died), cleared (100% completion), complete (Level Complete), left, manual.',
+            'fight.dungeon is there when Dungeon mode was on: the first hit started the clock; dying, or 3 seconds without damage, paused it at the last hit (durationMs counts fighting time only); endedBy says how the run ended: boss (the Level Complete right after a boss died), cleared (100% completion), complete (Level Complete), left, manual. gold is the gold you gained in the dungeon since the last reset (packet 0x35: piles picked up, rewards), paused or not, the boss\'s after the run included.',
             'Spells: a summon\'s damage counts for the skill that summoned it (Shadow Legion\'s clones); Charon\'s Blades\' ProcCriticalHit counts for Charon\'s Blades, except a hotbar spell\'s hit in its form, which stays with that spell (Crimson Butterfly); a skill\'s other powers count for it (Hailstone Embrace\'s Frost Armor, Black Miasma\'s Shadow Tendril). hits[].spell names the spell each hit counted for. The mount and the procs the client fires by itself are not casts.'
         ]
     };
@@ -255,6 +256,7 @@ function toCsv(report, meta) {
         row(['Completion %', dungeon.completion === null ? '' : dungeon.completion]);
         row(['Run ended', dungeon.endedBy ? ENDED_BY[dungeon.endedBy] || dungeon.endedBy : 'not yet']);
         row(['Deaths', dungeon.deaths]);
+        row(['Gold gained', dungeon.gold]);
     }
     row(['Exported', new Date().toISOString()]);
     const rotation = report.rotation || [];
@@ -284,6 +286,7 @@ function toSummary(report, meta) {
         if (dungeon.completion !== null) bits.push(dungeon.completion + '% cleared');
         if (dungeon.endedBy && !(dungeon.endedBy === 'cleared' && dungeon.completion !== null)) bits.push(ENDED_BY[dungeon.endedBy] || dungeon.endedBy);
         if (dungeon.deaths) bits.push(dungeon.deaths + (dungeon.deaths === 1 ? ' death' : ' deaths'));
+        if (dungeon.gold) bits.push(int(dungeon.gold) + ' gold');
         out.push('Dungeon: ' + bits.join(', '));
     }
     let i = 0;

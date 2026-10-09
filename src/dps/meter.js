@@ -236,6 +236,8 @@ class DpsMeter extends EventEmitter {
         this.held = []; // casts made while the clock was stopped, for a moment: see takeLeadIn
         this.lastHits = new Map(); // target -> Map(powerId -> your latest hit with it): what set a proc off
         this.pools = new Map(); // target and proc -> the Hemorrhage bleed on it: see recordProc
+        this.gold = 0; // gold gained in the dungeon since the last reset (Dungeon mode): see recordGold
+        this.goldNext = 0; // gold gained in the next dungeon before its first hit, for the run it starts
         this.runId = (this.runId || 0) + 1;
         this.lastCast = new Map(); // powerId -> its latest rotation entry
         this.lastByKey = new Map(); // spell row key -> its latest cast
@@ -372,6 +374,7 @@ class DpsMeter extends EventEmitter {
             this.held = []; // casts in the last level aren't part of a fight in this one
             this.lastHits = new Map(); // entity ids are the level's own
             this.pools = new Map();
+            this.goldNext = 0;
             const d = this.dungeon;
             if (this.dungeonMode && this._state !== 'idle') {
                 if (d.level && d.level !== level) this.endRun('left');
@@ -383,6 +386,28 @@ class DpsMeter extends EventEmitter {
             this.levels.push(level);
         }
         this.emit('change');
+    }
+
+    /**
+     * Gold you gained (packet 0x35: a pile you picked up, a reward), in Dungeon mode while you're in
+     * a dungeon: counted from the last reset whatever the clock is doing, since gold is picked up
+     * between fights and a boss's after the run is over. Gold in the next dungeon before its first
+     * hit belongs to the run that hit starts.
+     */
+    recordGold(amount) {
+        const n = Math.round(Number(amount) || 0);
+        if (n <= 0 || !this.dungeonMode || !this.inDungeon()) return;
+        if (this.dungeon.fresh) this.goldNext += n;
+        else this.gold += n;
+        this.emit('change');
+    }
+
+    /** Whether the level you're in is a dungeon (LevelTypes with rankings), not a town or your house. */
+    inDungeon() {
+        const level = this.place.level;
+        if (!level) return false;
+        const info = this.powers && this.powers.levelInfo ? this.powers.levelInfo(level) : { dungeon: /Dungeon|Mission/i.test(level) };
+        return Boolean(info.dungeon);
     }
 
     /** What the Damage Meter window and the export say about the run. */
@@ -407,6 +432,7 @@ class DpsMeter extends EventEmitter {
             lastBoss: d.lastBoss,
             playerDead: this.playerDead,
             nextRunPending: d.fresh,
+            gold: this.gold,
             idleSeconds: DUNGEON_IDLE_MS / 1000
         };
     }
@@ -530,12 +556,15 @@ class DpsMeter extends EventEmitter {
         let started = false;
         if (this.dungeonMode) {
             if (this.dungeon.fresh) {
-                // The first hit in the next dungeon: a new run, with the casts that led to it.
+                // The first hit in the next dungeon: a new run, with the casts that led to it and the
+                // gold picked up there before it.
                 const autoStart = this.autoStart;
                 const held = this.held;
+                const gold = this.goldNext;
                 this.reset();
                 this.autoStart = autoStart;
                 this.held = held;
+                this.gold = gold;
             }
             const d = this.dungeon;
             if (this._state !== 'running' && d.phase !== 'ended' && !this.playerDead) {

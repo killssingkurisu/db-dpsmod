@@ -178,6 +178,12 @@ class CombatTracker extends EventEmitter {
                 this.emit('enterWorld', P.parseEnterWorld(payload));
                 break;
             }
+            case P.PKT.RECEIVE_GOLD: {
+                // Gold the server gave you: a pile you picked up, a reward.
+                const g = P.parseReceiveGold(payload);
+                if (g.amount > 0) this.emit('gold', g.amount);
+                break;
+            }
             case P.PKT.BUFF_TICK_DOT: {
                 // A DoT of ours ticking on a mob another party member's client runs comes back
                 // from the server instead of going out from ours.

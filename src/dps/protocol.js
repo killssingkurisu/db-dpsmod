@@ -135,6 +135,8 @@ const PKT = {
     ENT_DESTROY: 0x0d,
     NEWLY_RELEVANT_ENTITY: 0x0f,
     ENTER_WORLD: 0x21,
+    /** Server -> client: gold you gained, a pile picked up or a reward (LinkUpdater.method_1797 -> Entity.GainMoney). */
+    RECEIVE_GOLD: 0x35,
     /** Client -> server when the dungeon is beaten (Level.method_682): completion %, then stats. */
     SET_LEVEL_COMPLETE: 0x3f,
     BUFF_TICK_DOT: 0x79,
@@ -199,6 +201,12 @@ function parseIncrementalUpdate(payload) {
 /** 0xb7, both ways: the dungeon's completion percent (0-100). */
 function parseLevelCompletion(payload) {
     return { percent: new BitReader(payload).uint() };
+}
+
+/** 0x35, server -> client: the gold you gained, then whether the client skips its gold pop-up. */
+function parseReceiveGold(payload) {
+    const r = new BitReader(payload);
+    return { amount: r.uint(), quiet: r.bool() };
 }
 
 /** 0x09, both directions: a power cast. */
@@ -387,5 +395,6 @@ module.exports = {
     parsePowerHit,
     parseBuffTickDot,
     parseNewlyRelevantEntity,
-    parseEnterWorld
+    parseEnterWorld,
+    parseReceiveGold
 };
