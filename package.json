@@ -1,7 +1,7 @@
 {
   "name": "db-dps-launcher",
   "productName": "DB DPS Launcher",
-  "version": "1.6.6",
+  "version": "1.6.7",
   "description": "A launcher for Dungeon Blitz R with a DPS meter built in",
   "author": "killssingkurisu",
   "license": "MIT",
